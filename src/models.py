@@ -220,8 +220,9 @@ class IMAStatus(BaseModel):
 
 
 class KnowledgeQaInfo(BaseModel):
-    tags: List[str] = []
-    knowledge_ids: List[str] = []
+    tags: List[str] = Field(default_factory=list)
+    knowledge_ids: List[str] = Field(default_factory=list)
+    media_id_infos: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class CommandInfo(BaseModel):
@@ -249,3 +250,4 @@ class AskQuestionRequest(BaseModel):
     model_info: ModelInfo
     history_info: HistoryInfo
     device_info: DeviceInfo
+    client_tools: List[Any] = Field(default_factory=list)

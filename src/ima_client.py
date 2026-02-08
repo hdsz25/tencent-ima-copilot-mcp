@@ -247,18 +247,10 @@ class IMAAPIClient:
                 )
 
                 refresh_url = f"{self.base_url}{self.refresh_endpoint}"
-                
-                # 构建请求头 - 不使用 _build_headers 以避免发送过期的 token
-                refresh_headers = {
-                    "accept": "application/json",
-                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-                    "content-type": "application/json",
-                    "from_browser_ima": "1",
-                    "x-ima-cookie": self.config.x_ima_cookie,
-                    "x-ima-bkn": self.config.x_ima_bkn,
-                    "referer": "https://ima.qq.com/wikis",
-                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-                }
+                refresh_headers = self._build_headers(
+                    for_refresh=True,
+                    include_authorization=False,
+                )
                 
                 request_body = refresh_request.model_dump()
 
@@ -319,12 +311,10 @@ class IMAAPIClient:
                 cookies[name.strip()] = value.strip()
         return cookies
 
-    def _build_headers(self, for_init_session: bool = False) -> Dict[str, str]:
-        """构建请求头"""
+    def _build_x_ima_cookie(self, include_current_token: bool = True) -> str:
+        """构建 x-ima-cookie，必要时注入最新 token"""
         x_ima_cookie = self.config.x_ima_cookie
-        
-        # 如果有新的 token，动态替换到 Cookie 中
-        if self.config.current_token:
+        if include_current_token and self.config.current_token:
             if 'IMA-TOKEN=' in x_ima_cookie:
                 x_ima_cookie = re.sub(
                     r'IMA-TOKEN=[^;]+',
@@ -333,22 +323,65 @@ class IMAAPIClient:
                 )
             else:
                 x_ima_cookie = x_ima_cookie.rstrip('; ') + f'; IMA-TOKEN={self.config.current_token}'
-        
-        headers = {
-            "x-ima-cookie": x_ima_cookie,
-            "from_browser_ima": "1",
+        return x_ima_cookie
+
+    def _extract_user_agent(self) -> str:
+        """从 x-ima-cookie 中提取 IMA-IUA，缺省回退到固定 UA"""
+        default_user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0"
+        )
+        try:
+            match = re.search(r"IMA-IUA=([^;]+)", self.config.x_ima_cookie)
+            if match:
+                return unquote(match.group(1))
+        except Exception:
+            pass
+        return default_user_agent
+
+    def _generate_traceparent(self) -> str:
+        """生成 W3C traceparent"""
+        trace_id = secrets.token_hex(16)
+        span_id = secrets.token_hex(8)
+        return f"00-{trace_id}-{span_id}-01"
+
+    def _build_headers(
+        self,
+        *,
+        for_init_session: bool = False,
+        for_refresh: bool = False,
+        include_authorization: bool = True,
+    ) -> Dict[str, str]:
+        """构建统一请求头（refresh/init_session/qa）"""
+        accept = "application/json" if (for_init_session or for_refresh) else "*/*"
+        content_type = "application/json" if (for_init_session or for_refresh) else "text/event-stream"
+
+        headers: Dict[str, str] = {
+            "accept": accept,
+            "accept-language": "zh-CN,zh;q=0.9",
+            "content-type": content_type,
             "extension_version": "999.999.999",
+            "from_browser_ima": "1",
+            "priority": "u=1, i",
+            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144", "Microsoft Edge";v="144"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "traceparent": self._generate_traceparent(),
             "x-ima-bkn": self.config.x_ima_bkn,
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-            "accept": "application/json" if for_init_session else "*/*",
-            "content-type": "application/json" if for_init_session else "text/event-stream",
-            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "x-ima-cookie": self._build_x_ima_cookie(include_current_token=not for_refresh),
             "referer": "https://ima.qq.com/wikis",
+            "user-agent": self._extract_user_agent(),
         }
 
-        if self.config.current_token:
+        if not for_init_session and not for_refresh:
+            headers["cache-control"] = "no-cache"
+
+        if include_authorization and not for_refresh and self.config.current_token:
             headers["authorization"] = f"Bearer {self.config.current_token}"
-        
+
         return headers
 
     @retry(
@@ -765,11 +798,11 @@ class IMAAPIClient:
 
         init_request = InitSessionRequest(
             envInfo=EnvInfo(
-                robotType=5,
+                robotType=self.config.robot_type,
                 interactType=0
             ),
             relatedUrl=kb_id,
-            sceneType=1,
+            sceneType=self.config.scene_type,
             msgsLimit=10,
             forbidAutoAddToHistoryList=False,
             knowledgeBaseInfoWithFolder=KnowledgeBaseInfoWithFolder(
@@ -828,50 +861,50 @@ class IMAAPIClient:
 
         # 生成trace_id用于跟踪
         trace_id = str(uuid.uuid4())[:8]
+        trace_logger = logger.bind(trace_id=trace_id)
 
-        with logger.contextualize(trace_id=trace_id):
-            logger.debug("发送问题", question_preview=question[:50])
+        trace_logger.debug("发送问题", question_preview=question[:50])
 
-            response = None
-            try:
-                response = await session.post(
-                    url,
-                    json=request_data.model_dump(),
-                    headers=headers
-                )
+        response = None
+        try:
+            response = await session.post(
+                url,
+                json=request_data.model_dump(),
+                headers=headers
+            )
 
-                # 检查响应状态
-                if response.status != 200:
-                    response_text = await response.text()
-                    logger.error("HTTP请求失败", status=response.status, response=response_text[:500])
-                    raise ValueError(f"HTTP {response.status}: {response_text[:200]}")
+            # 检查响应状态
+            if response.status != 200:
+                response_text = await response.text()
+                trace_logger.error("HTTP请求失败", status=response.status, response=response_text[:500])
+                raise ValueError(f"HTTP {response.status}: {response_text[:200]}")
 
-                content_type = response.headers.get('content-type', '')
-                if 'text/event-stream' not in content_type:
-                    response_text = await response.text()
-                    try:
-                        error_data = json.loads(response_text)
-                        raise ValueError(f"API错误 (code: {error_data.get('code')}): {error_data.get('msg')}")
-                    except json.JSONDecodeError:
-                        raise ValueError(f"意外响应类型: {content_type}, 内容: {response_text[:200]}")
+            content_type = response.headers.get('content-type', '')
+            if 'text/event-stream' not in content_type:
+                response_text = await response.text()
+                try:
+                    error_data = json.loads(response_text)
+                    raise ValueError(f"API错误 (code: {error_data.get('code')}): {error_data.get('msg')}")
+                except json.JSONDecodeError:
+                    raise ValueError(f"意外响应类型: {content_type}, 内容: {response_text[:200]}")
 
-                # 处理流式响应
-                message_count = 0
-                async for message in self._process_sse_stream(
-                    response,
-                    trace_id=trace_id,
-                    attempt_index=0,
-                    question=question
-                ):
-                    message_count += 1
-                    yield message
+            # 处理流式响应
+            message_count = 0
+            async for message in self._process_sse_stream(
+                response,
+                trace_id=trace_id,
+                attempt_index=0,
+                question=question
+            ):
+                message_count += 1
+                yield message
 
-                if message_count == 0:
-                    yield IMAMessage(type=MessageType.SYSTEM, content="未收到有效响应", raw="No SSE messages")
+            if message_count == 0:
+                yield IMAMessage(type=MessageType.SYSTEM, content="未收到有效响应", raw="No SSE messages")
 
-            finally:
-                if response and not response.closed:
-                    response.close()
+        finally:
+            if response and not response.closed:
+                response.close()
 
     def _is_login_expired_error(self, error_str: str) -> bool:
         """检测是否是登录过期相关错误"""

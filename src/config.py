@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from loguru import logger
-from pydantic import ValidationError
+from pydantic import AliasChoices, Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from models import IMAConfig, IMAStatus
@@ -76,7 +76,13 @@ class IMAEnvironmentConfig(BaseSettings):
     DEFAULT_SCENE_TYPE: int = 1
     DEFAULT_MODEL_TYPE: int = 4
 
-    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID
+    knowledge_base_id: str = Field(
+        DEFAULT_KNOWLEDGE_BASE_ID,
+        validation_alias=AliasChoices(
+            "IMA_KNOWLEDGE_BASE_ID",
+            "knowledgeBaseId",
+        ),
+    )
     uskey: Optional[str] = None
     client_id: Optional[str] = None
     robot_type: int = DEFAULT_ROBOT_TYPE

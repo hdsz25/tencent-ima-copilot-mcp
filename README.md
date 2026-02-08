@@ -186,7 +186,7 @@ npx @modelcontextprotocol/inspector
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `IMA_KNOWLEDGE_BASE_ID` | 知识库 ID | `7305806844290061` |
+| `IMA_KNOWLEDGE_BASE_ID` / `knowledgeBaseId` | 知识库 ID（两者等价） | `7305806844290061` |
 | `IMA_MCP_HOST` | MCP 服务器地址 | `127.0.0.1` |
 | `IMA_MCP_PORT` | MCP 服务器端口 | `8081` |
 | `IMA_MCP_LOG_LEVEL` | 日志级别 (支持 `DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
@@ -209,7 +209,7 @@ A:
 **Q: 如何连接特定的知识库？**
 
 A:
-在 `.env` 文件中设置 `IMA_KNOWLEDGE_BASE_ID` 即可。获取方法：
+在 `.env` 文件中设置 `IMA_KNOWLEDGE_BASE_ID`（或 `knowledgeBaseId`）即可。获取方法：
 1. 在 IMA 网页选择知识库
 2. 找到 `init_session` 请求
 3. 查看 Payload 中的 `knowledge_base_id`
