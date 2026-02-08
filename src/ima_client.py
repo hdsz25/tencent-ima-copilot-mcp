@@ -25,6 +25,7 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    retry_if_exception,
     retry_if_exception_type,
     before_sleep_log,
 )
@@ -54,6 +55,10 @@ from models import (
 
 
 
+class AuthenticationError(ValueError):
+    """不可重试的认证异常"""
+
+
 class IMAAPIClient:
     """IMA API 客户端"""
 
@@ -66,6 +71,7 @@ class IMAAPIClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.raw_log_dir: Optional[Path] = None
         self._token_lock = asyncio.Lock()  # 保护 token 刷新过程
+        self._last_auth_error: Optional[str] = None
 
         if getattr(self.config, "enable_raw_logging", False):
             raw_dir_value = getattr(self.config, "raw_log_dir", None)
@@ -227,6 +233,7 @@ class IMAAPIClient:
                 return True
 
             logger.info("🔄 开始刷新 Token")
+            self._last_auth_error = None
             
             if not self.config.user_id or not self.config.refresh_token:
                 logger.info("从 cookies 中解析 user_id 和 refresh_token")
@@ -234,6 +241,7 @@ class IMAAPIClient:
                 self.config.refresh_token = self._parse_refresh_token_from_cookies()
 
                 if not self.config.user_id or not self.config.refresh_token:
+                    self._last_auth_error = "缺少 user_id 或 refresh_token，请重新抓取 IMA 登录态"
                     logger.warning("缺少token刷新所需的user_id或refresh_token")
                     return False
 
@@ -270,23 +278,28 @@ class IMAAPIClient:
                                 self.config.current_token = refresh_response.token
                                 self.config.token_valid_time = int(refresh_response.token_valid_time or "7200")
                                 self.config.token_updated_at = datetime.now()
+                                self._last_auth_error = None
 
                                 logger.info(f"✅ Token刷新成功 (有效期: {self.config.token_valid_time}秒)")
                                 return True
                             else:
+                                self._last_auth_error = refresh_response.msg
                                 logger.warning("=" * 60)
                                 logger.warning(f"Token刷新失败: {refresh_response.msg} (Code: {refresh_response.code})")
                                 logger.warning("=" * 60)
                                 return False
                         except json.JSONDecodeError as je:
+                            self._last_auth_error = f"刷新响应解析失败: {je}"
                             logger.error(f"无法解析响应为 JSON: {je}")
                             logger.error(f"原始响应: {response_text[:200]}")
                             return False
                     else:
+                        self._last_auth_error = f"Token刷新请求失败: HTTP {response.status}"
                         logger.error(f"Token刷新请求失败: HTTP {response.status}")
                         return False
 
             except Exception as e:
+                self._last_auth_error = f"Token刷新异常: {type(e).__name__}: {e}"
                 logger.error(f"Token刷新异常: {type(e).__name__}: {e}")
                 return False
 
@@ -295,6 +308,11 @@ class IMAAPIClient:
         if self._is_token_expired():
             return await self.refresh_token()
         return True
+
+    def _build_auth_error_message(self) -> str:
+        """生成用户可读的认证失败提示"""
+        detail = self._last_auth_error or "登录态无效或已过期，请重新抓取 IMA_X_IMA_COOKIE 和 IMA_X_IMA_BKN"
+        return f"Authentication failed - {detail}"
 
     
     def _parse_cookies(self, cookie_string: str) -> Dict[str, str]:
@@ -912,10 +930,24 @@ class IMAAPIClient:
             "Session initialization failed",
             "登录过期", "登录失败", "authentication failed", "认证失败",
             "code: 600001", "code: 600002", "code: 600003",
+            "code: 41", "110031", "token session expired",
             "token expired", "会话已过期", "请重新登录", "unauthorized", "401"
         ]
         error_lower = error_str.lower()
         return any(pattern.lower() in error_lower for pattern in login_expired_patterns)
+
+    def _should_retry_ask_exception(self, exception: BaseException) -> bool:
+        """问答链路的重试判定：认证问题不重试，瞬态错误才重试"""
+        if isinstance(exception, AuthenticationError):
+            return False
+
+        if isinstance(exception, (aiohttp.ClientError, asyncio.TimeoutError)):
+            return True
+
+        if isinstance(exception, ValueError):
+            return not self._is_login_expired_error(str(exception))
+
+        return False
 
     async def ask_question_complete(self, question: str, timeout: Optional[float] = None) -> List[IMAMessage]:
         """获取完整的问题回答 - 支持自动重试"""
@@ -946,7 +978,7 @@ class IMAAPIClient:
             retryer = AsyncRetrying(
                 stop=stop_after_attempt(self.config.retry_count + 1),
                 wait=wait_exponential(multiplier=1, min=1, max=10),
-                retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, ValueError)),
+                retry=retry_if_exception(self._should_retry_ask_exception),
                 before_sleep=before_sleep_log(logger, "WARNING"),
                 reraise=True
             )
@@ -955,10 +987,14 @@ class IMAAPIClient:
                 with attempt:
                     try:
                         return await _attempt_request()
+                    except AuthenticationError:
+                        raise
                     except ValueError as e:
                         if self._is_login_expired_error(str(e)):
                             logger.info("检测到登录失效，强制刷新 Token 并重试...")
-                            await self.refresh_token()
+                            refreshed = await self.refresh_token()
+                            if not refreshed:
+                                raise AuthenticationError(self._build_auth_error_message()) from e
                         raise
 
         except Exception as e:
