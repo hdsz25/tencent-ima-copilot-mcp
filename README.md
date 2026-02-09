@@ -11,6 +11,8 @@
 - 🛠️ **增强型 MCP 工具**: 提供腾讯 IMA 知识库问答功能，返回结果包含回答文本和结构化参考资料
 - 🔄 **Token 自动刷新**: 智能管理认证 token，自动刷新保持会话有效
 - 💪 **Tenacity-powered Retries**: 集成 tenacity 库，优化重试机制，支持指数退避和针对性错误重试
+- 🧯 **Code=3 自愈**: 对高并发瞬时 `Code=3` 错误执行退避重试并自动恢复
+- 🚦 **并发限流**: 默认串行问答（并发=1），降低请求突发导致的系统错误
 - 📝 **Loguru-enhanced Logging**: 采用 Loguru 提升日志体验，提供更清晰、结构化的日志输出
 - ⏱️ **超时保护**: 内置请求超时机制，防止长时间阻塞 (已提升至 300 秒)
 - 🎯 **一键启动**: 简化的启动流程，自动环境检查和配置验证
@@ -160,6 +162,8 @@ npx @modelcontextprotocol/inspector
 **特性:**
 - 自动管理会话，无需手动创建
 - 智能 token 刷新，确保认证有效
+- 内置并发限流（默认 `IMA_ASK_CONCURRENCY_LIMIT=1`）
+- 检测到 `Code=3` 且无文本时自动指数退避重试（最多 2 次）
 - **300 秒超时保护**，防止长时间等待
 - 返回内容为 **`TextContent` 列表**，包含**回答文本**和格式化后的**参考资料**
 
@@ -208,6 +212,8 @@ knowledge_base_id: "7305806844290061"
 | `IMA_MCP_PORT` | MCP 服务器端口 | `8081` |
 | `IMA_MCP_LOG_LEVEL` | 日志级别 (支持 `DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
 | `IMA_REQUEST_TIMEOUT` | IMA API 请求超时时间（秒） | `30` |
+| `IMA_RETRY_COUNT` | 网络/超时类异常重试次数 | `3` |
+| `IMA_ASK_CONCURRENCY_LIMIT` | 问答并发上限（建议 1-2） | `1` |
 | `IMA_ROBOT_TYPE` | 机器人类型 | `5` |
 | `IMA_SCENE_TYPE` | 场景类型 | `1` |
 | `IMA_MODEL_TYPE` | 模型类型 | `4` |
@@ -249,6 +255,13 @@ A:
 1. 在 `.env` 中设置 `IMA_KNOWLEDGE_BASE_IDS=id1,id2,id3`
 2. 调用工具时使用 `ask_with_kb(question, knowledge_base_id)`
 3. 若调用 `ask`，会提示错误并给出可用 `knowledge_base_id` 列表
+
+**Q: 偶发出现 `Code=3` 且无文本怎么办？**
+
+A:
+1. 先保持默认并发（`IMA_ASK_CONCURRENCY_LIMIT=1`）
+2. 避免同一知识库短时间突发并发请求
+3. 服务已内置 `Code=3` 退避重试；若仍频繁出现，可适当增加请求间隔
 
 ## 许可证
 

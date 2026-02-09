@@ -72,6 +72,7 @@ class IMAAPIClient:
         self.raw_log_dir: Optional[Path] = None
         self._token_lock = asyncio.Lock()  # 保护 token 刷新过程
         self._last_auth_error: Optional[str] = None
+        self._ask_semaphore = asyncio.Semaphore(max(1, getattr(self.config, "ask_concurrency_limit", 1)))
 
         if getattr(self.config, "enable_raw_logging", False):
             raw_dir_value = getattr(self.config, "raw_log_dir", None)
@@ -494,6 +495,8 @@ class IMAAPIClient:
         try:
             if line.startswith('data: '):
                 data = line[6:]
+            elif line.startswith('data:'):
+                data = line[5:]
             elif line.startswith(('event: ', 'id: ')):
                 return None
             else:
@@ -949,6 +952,37 @@ class IMAAPIClient:
 
         return False
 
+    def _collect_system_codes(self, messages: List[IMAMessage]) -> List[int]:
+        """收集 system 消息中的 Code/code 返回码"""
+        code_pattern = re.compile(r"['\"]?code['\"]?\s*[:=]\s*(\d+)", re.IGNORECASE)
+        codes: List[int] = []
+        for message in messages:
+            if message.type != MessageType.SYSTEM:
+                continue
+            for raw_code in code_pattern.findall(message.content or ""):
+                try:
+                    parsed = int(raw_code)
+                except ValueError:
+                    continue
+                if parsed not in codes:
+                    codes.append(parsed)
+        return codes
+
+    def _is_code3_only_response(self, messages: List[IMAMessage]) -> bool:
+        """判断是否属于仅包含 Code=3 的无文本响应"""
+        if not messages:
+            return False
+
+        has_text = any(
+            message.type == MessageType.TEXT and (message.content or "").strip()
+            for message in messages
+        )
+        if has_text:
+            return False
+
+        codes = self._collect_system_codes(messages)
+        return bool(codes) and codes == [3]
+
     async def ask_question_complete(
         self,
         question: str,
@@ -979,32 +1013,55 @@ class IMAAPIClient:
                 raise ValueError("未收到有效消息")
             return messages
 
-        try:
-            retryer = AsyncRetrying(
-                stop=stop_after_attempt(self.config.retry_count + 1),
-                wait=wait_exponential(multiplier=1, min=1, max=10),
-                retry=retry_if_exception(self._should_retry_ask_exception),
-                before_sleep=before_sleep_log(logger, "WARNING"),
-                reraise=True
-            )
-            
-            async for attempt in retryer:
-                with attempt:
-                    try:
-                        return await _attempt_request()
-                    except AuthenticationError:
-                        raise
-                    except ValueError as e:
-                        if self._is_login_expired_error(str(e)):
-                            logger.info("检测到登录失效，强制刷新 Token 并重试...")
-                            refreshed = await self.refresh_token()
-                            if not refreshed:
-                                raise AuthenticationError(self._build_auth_error_message()) from e
-                        raise
+        async with self._ask_semaphore:
+            try:
+                async def _attempt_request_with_retry() -> List[IMAMessage]:
+                    retryer = AsyncRetrying(
+                        stop=stop_after_attempt(self.config.retry_count + 1),
+                        wait=wait_exponential(multiplier=1, min=1, max=10),
+                        retry=retry_if_exception(self._should_retry_ask_exception),
+                        before_sleep=before_sleep_log(logger, "WARNING"),
+                        reraise=True,
+                    )
 
-        except Exception as e:
-            logger.exception("问答失败", question_preview=question[:50])
-            return [IMAMessage(type=MessageType.SYSTEM, content=f"请求失败: {e}", raw=str(e))]
+                    async for attempt in retryer:
+                        with attempt:
+                            try:
+                                return await _attempt_request()
+                            except AuthenticationError:
+                                raise
+                            except ValueError as e:
+                                if self._is_login_expired_error(str(e)):
+                                    logger.info("检测到登录失效，强制刷新 Token 并重试...")
+                                    refreshed = await self.refresh_token()
+                                    if not refreshed:
+                                        raise AuthenticationError(self._build_auth_error_message()) from e
+                                raise
+
+                    raise ValueError("问答重试耗尽")
+
+                base_backoff = 4.0
+                max_code3_retry = 2
+
+                for code3_retry_used in range(max_code3_retry + 1):
+                    messages = await _attempt_request_with_retry()
+                    if not self._is_code3_only_response(messages):
+                        return messages
+
+                    if code3_retry_used >= max_code3_retry:
+                        return messages
+
+                    delay = min(base_backoff * (2 ** code3_retry_used), 16.0) + random.uniform(0.2, 0.8)
+                    logger.warning(
+                        f"检测到 Code=3 且无文本响应，执行退避重试 (第{code3_retry_used + 1}/{max_code3_retry}次, sleep={delay:.1f}s)"
+                    )
+                    await asyncio.sleep(delay)
+
+                return [IMAMessage(type=MessageType.SYSTEM, content="请求失败: Code=3 重试后仍无有效文本", raw="code3_retry_exhausted")]
+
+            except Exception as e:
+                logger.exception("问答失败", question_preview=question[:50])
+                return [IMAMessage(type=MessageType.SYSTEM, content=f"请求失败: {e}", raw=str(e))]
 
     def _extract_text_content(self, messages: List[IMAMessage]) -> str:
         """从消息列表中提取文本内容 - 仅提取文本类型的消息"""

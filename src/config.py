@@ -30,6 +30,7 @@ class AppConfig(BaseSettings):
     api_endpoint: str = "https://ima.qq.com/cgi-bin/assistant/qa"
     request_timeout: int = 30
     retry_count: int = 3
+    ask_concurrency_limit: int = 1
     proxy: Optional[str] = None
 
     model_config = SettingsConfigDict(
@@ -182,6 +183,7 @@ class ConfigManager:
                 'model_type': self.env_config.model_type or self.env_config.DEFAULT_MODEL_TYPE,
                 'timeout': self.app_config.request_timeout,
                 'retry_count': self.app_config.retry_count,
+                'ask_concurrency_limit': max(1, self.app_config.ask_concurrency_limit),
                 'proxy': self.app_config.proxy,
                 'created_at': datetime.now()
             }
