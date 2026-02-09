@@ -5,7 +5,7 @@ import uuid
 import base64
 import secrets
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 from pydantic import AliasChoices, Field, ValidationError
@@ -76,11 +76,18 @@ class IMAEnvironmentConfig(BaseSettings):
     DEFAULT_SCENE_TYPE: int = 1
     DEFAULT_MODEL_TYPE: int = 4
 
-    knowledge_base_id: str = Field(
-        DEFAULT_KNOWLEDGE_BASE_ID,
+    knowledge_base_id: Optional[str] = Field(
+        None,
         validation_alias=AliasChoices(
             "IMA_KNOWLEDGE_BASE_ID",
             "knowledgeBaseId",
+        ),
+    )
+    knowledge_base_ids: Optional[str] = Field(
+        None,
+        validation_alias=AliasChoices(
+            "IMA_KNOWLEDGE_BASE_IDS",
+            "knowledgeBaseIds",
         ),
     )
     uskey: Optional[str] = None
@@ -124,15 +131,50 @@ class ConfigManager:
 
         return config_data
 
+    @staticmethod
+    def _parse_knowledge_base_ids(raw_value: Optional[str]) -> List[str]:
+        if not raw_value:
+            return []
+
+        parsed_ids: List[str] = []
+        for item in raw_value.split(","):
+            candidate = item.strip()
+            if candidate and candidate not in parsed_ids:
+                parsed_ids.append(candidate)
+
+        return parsed_ids
+
     def load_config(self, auto_generate: bool = True) -> Optional[IMAConfig]:
         """从环境变量加载配置"""
         try:
+            configured_single_kb_id = (self.env_config.knowledge_base_id or "").strip()
+            configured_single_kb_ids = self._parse_knowledge_base_ids(configured_single_kb_id)
+            configured_multi_kb_ids = self._parse_knowledge_base_ids(self.env_config.knowledge_base_ids)
+
+            if configured_single_kb_id and len(configured_single_kb_ids) == 1:
+                resolved_kb_id = configured_single_kb_id
+                resolved_kb_ids = [configured_single_kb_id]
+            elif len(configured_single_kb_ids) > 1 and not configured_multi_kb_ids:
+                logger.warning(
+                    "检测到 IMA_KNOWLEDGE_BASE_ID 包含多个值，将按多知识库模式处理；"
+                    "建议改用 IMA_KNOWLEDGE_BASE_IDS"
+                )
+                resolved_kb_id = configured_single_kb_ids[0]
+                resolved_kb_ids = configured_single_kb_ids
+            elif configured_multi_kb_ids:
+                resolved_kb_id = configured_multi_kb_ids[0]
+                resolved_kb_ids = configured_multi_kb_ids
+            else:
+                resolved_kb_id = self.env_config.DEFAULT_KNOWLEDGE_BASE_ID
+                resolved_kb_ids = [resolved_kb_id]
+
             # 从环境变量获取配置数据
             config_data = {
                 'cookies': self.env_config.cookies,
                 'x_ima_cookie': self.env_config.x_ima_cookie,
                 'x_ima_bkn': self.env_config.x_ima_bkn,
-                'knowledge_base_id': self.env_config.knowledge_base_id or self.env_config.DEFAULT_KNOWLEDGE_BASE_ID,
+                'knowledge_base_id': resolved_kb_id,
+                'knowledge_base_ids': resolved_kb_ids,
                 'uskey': self.env_config.uskey,
                 'client_id': self.env_config.client_id,
                 'robot_type': self.env_config.robot_type or self.env_config.DEFAULT_ROBOT_TYPE,
@@ -168,7 +210,7 @@ class ConfigManager:
 
     def validate_config(self) -> tuple[bool, Optional[str]]:
         """验证环境变量配置"""
-        # 只需要 X-Ima-Cookie 和 X-Ima-Bkn，COOKIES 是可选的
+        # 必需认证信息：X-Ima-Cookie 和 X-Ima-Bkn
         required_fields = [
             (self.env_config.x_ima_cookie, "IMA_X_IMA_COOKIE"),
             (self.env_config.x_ima_bkn, "IMA_X_IMA_BKN")
@@ -177,6 +219,12 @@ class ConfigManager:
         for value, name in required_fields:
             if not value or value.strip() == "":
                 return False, f"Missing required environment variable: {name}"
+
+        single_kb_ids = self._parse_knowledge_base_ids((self.env_config.knowledge_base_id or "").strip())
+        multi_kb_ids = self._parse_knowledge_base_ids(self.env_config.knowledge_base_ids)
+
+        if not single_kb_ids and not multi_kb_ids:
+            return False, "Missing required environment variable: IMA_KNOWLEDGE_BASE_ID or IMA_KNOWLEDGE_BASE_IDS"
 
         return True, None
 
@@ -192,6 +240,8 @@ class ConfigManager:
                 status.is_configured = True
                 status.session_info = {
                     'client_id': config.client_id,
+                    'knowledge_base_id': config.knowledge_base_id,
+                    'knowledge_base_ids': config.knowledge_base_ids,
                     'created_at': config.created_at.isoformat(),
                     'updated_at': config.updated_at.isoformat() if config.updated_at else None,
                 }

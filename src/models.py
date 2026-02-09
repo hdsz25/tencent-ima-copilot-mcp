@@ -166,6 +166,7 @@ class IMAConfig(BaseModel):
 
     # 核心参数
     knowledge_base_id: str = Field(..., description="知识库ID")
+    knowledge_base_ids: List[str] = Field(default_factory=list, description="可用知识库ID列表")
 
     # 设备信息
     uskey: Optional[str] = Field(None, description="设备 uskey（动态生成，暂时可选）")

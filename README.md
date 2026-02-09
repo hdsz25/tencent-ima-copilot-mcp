@@ -163,6 +163,22 @@ npx @modelcontextprotocol/inspector
 - **300 秒超时保护**，防止长时间等待
 - 返回内容为 **`TextContent` 列表**，包含**回答文本**和格式化后的**参考资料**
 
+> 注意：当配置了多个知识库 ID 时，`ask` 会直接报错并提示改用 `ask_with_kb`。
+
+### 2. `ask_with_kb`
+
+向指定知识库询问问题（多知识库模式）
+
+**参数:**
+- `question` (必需): 要询问的问题
+- `knowledge_base_id` (必需): 目标知识库 ID（必须在配置列表中）
+
+**示例:**
+```
+问题: "总结这个知识库的核心内容"
+knowledge_base_id: "7305806844290061"
+```
+
 ## 可用的 MCP 资源
 
 ### 1. `ima://config`
@@ -186,7 +202,8 @@ npx @modelcontextprotocol/inspector
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `IMA_KNOWLEDGE_BASE_ID` / `knowledgeBaseId` | 知识库 ID（两者等价） | `7305806844290061` |
+| `IMA_KNOWLEDGE_BASE_ID` / `knowledgeBaseId` | 单知识库 ID（两者等价） | 无（必须显式配置） |
+| `IMA_KNOWLEDGE_BASE_IDS` / `knowledgeBaseIds` | 多知识库 ID 列表（逗号分隔） | 无 |
 | `IMA_MCP_HOST` | MCP 服务器地址 | `127.0.0.1` |
 | `IMA_MCP_PORT` | MCP 服务器端口 | `8081` |
 | `IMA_MCP_LOG_LEVEL` | 日志级别 (支持 `DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
@@ -194,6 +211,18 @@ npx @modelcontextprotocol/inspector
 | `IMA_ROBOT_TYPE` | 机器人类型 | `5` |
 | `IMA_SCENE_TYPE` | 场景类型 | `1` |
 | `IMA_MODEL_TYPE` | 模型类型 | `4` |
+
+### 知识库配置模式
+
+- 单知识库模式（兼容旧逻辑）：配置 `IMA_KNOWLEDGE_BASE_ID`（或 `knowledgeBaseId`），使用 `ask` 或 `ask_with_kb` 均可。
+- 多知识库模式：配置 `IMA_KNOWLEDGE_BASE_IDS`（或 `knowledgeBaseIds`，逗号分隔），必须使用 `ask_with_kb`。
+- 同时配置两者时：优先使用 `IMA_KNOWLEDGE_BASE_ID`（单知识库模式）。
+- 启动强校验：若 `IMA_KNOWLEDGE_BASE_ID` 与 `IMA_KNOWLEDGE_BASE_IDS` 都未配置，服务将直接退出。
+
+### 从旧版本迁移
+
+- 只用一个知识库：保持原有 `IMA_KNOWLEDGE_BASE_ID=<id>` 即可，无需改调用方式。
+- 需要多个知识库：新增 `IMA_KNOWLEDGE_BASE_IDS=id1,id2,...`，并把调用从 `ask(question)` 改为 `ask_with_kb(question, knowledge_base_id)`。
 
 ## 故障排除
 
@@ -213,6 +242,13 @@ A:
 1. 在 IMA 网页选择知识库
 2. 找到 `init_session` 请求
 3. 查看 Payload 中的 `knowledge_base_id`
+
+**Q: 多知识库怎么配置和调用？**
+
+A:
+1. 在 `.env` 中设置 `IMA_KNOWLEDGE_BASE_IDS=id1,id2,id3`
+2. 调用工具时使用 `ask_with_kb(question, knowledge_base_id)`
+3. 若调用 `ask`，会提示错误并给出可用 `knowledge_base_id` 列表
 
 ## 许可证
 

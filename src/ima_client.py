@@ -949,7 +949,12 @@ class IMAAPIClient:
 
         return False
 
-    async def ask_question_complete(self, question: str, timeout: Optional[float] = None) -> List[IMAMessage]:
+    async def ask_question_complete(
+        self,
+        question: str,
+        timeout: Optional[float] = None,
+        knowledge_base_id: Optional[str] = None,
+    ) -> List[IMAMessage]:
         """获取完整的问题回答 - 支持自动重试"""
         start_time = time.time()
 
@@ -959,7 +964,7 @@ class IMAAPIClient:
 
             messages = []
             # 每次尝试使用新的 session_id 以确保隔离
-            session_id = await self.init_session()
+            session_id = await self.init_session(knowledge_base_id=knowledge_base_id)
             
             gen = self.ask_question(question, session_id=session_id)
             try:
