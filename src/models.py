@@ -39,6 +39,28 @@ class KnowledgeBaseInfo(BaseModel):
     permission_type: Optional[int] = None
 
 
+class KnowledgeBaseCatalogEntry(BaseModel):
+    """知识库目录条目"""
+    id: str
+    name: str
+    category: str = "unknown"
+    group_name: Optional[str] = None
+    type: Optional[int] = None
+    description: Optional[str] = None
+    introduction: Optional[str] = None
+    permission_type: Optional[int] = None
+
+
+class KnowledgeBaseCatalog(BaseModel):
+    """知识库目录持久化模型"""
+    synced_at: Optional[datetime] = None
+    entries: List[KnowledgeBaseCatalogEntry] = Field(default_factory=list)
+
+    @field_serializer('synced_at')
+    def serialize_synced_at(self, value: Optional[datetime]) -> Optional[str]:
+        return value.isoformat() if value else None
+
+
 class MediaInfo(BaseModel):
     """媒体信息模型"""
     id: str
@@ -188,7 +210,7 @@ class IMAConfig(BaseModel):
     proxy: Optional[str] = Field(None, description="代理设置")
     timeout: int = Field(30, description="请求超时时间（秒）")
     retry_count: int = Field(3, description="重试次数")
-    ask_concurrency_limit: int = Field(1, description="问答并发上限")
+    ask_concurrency_limit: int = Field(2, description="问答并发上限")
     enable_raw_logging: bool = Field(False, description="Enable writing raw SSE responses to disk")
     raw_log_dir: Optional[str] = Field(None, description="Directory for raw SSE logs")
     raw_log_max_bytes: int = Field(1048576, description="Maximum bytes saved per raw response")

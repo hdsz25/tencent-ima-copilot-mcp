@@ -1,5 +1,5 @@
 # Multi-stage build for smaller final image
-FROM python:3.11-slim AS builder
+FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
@@ -8,7 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 # Final stage
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -23,8 +23,8 @@ COPY ima_server_simple.py .
 ENV PATH=/root/.local/bin:$PATH
 
 # Set default environment variables (only optional ones)
-# Required variables: IMA_X_IMA_COOKIE, IMA_X_IMA_BKN, IMA_KNOWLEDGE_BASE_ID
-# These MUST be provided when running the container
+# Required variables: IMA_X_IMA_COOKIE, IMA_X_IMA_BKN
+# Knowledge base IDs can be synchronized later via sync_knowledge_bases
 
 # Optional: Complete Cookie string (for enhanced authentication)
 ENV IMA_COOKIES=""
@@ -42,13 +42,15 @@ ENV IMA_MCP_LOG_LEVEL=INFO
 # IMA API configuration
 ENV IMA_REQUEST_TIMEOUT=30
 ENV IMA_RETRY_COUNT=3
+ENV IMA_ASK_CONCURRENCY_LIMIT=2
+ENV IMA_KNOWLEDGE_BASE_CATALOG_FILE=/app/data/.ima_knowledge_bases.json
 ENV IMA_PROXY=""
 
 # Expose MCP server port
 EXPOSE 8081
 
-# Create logs directory
-RUN mkdir -p /app/logs/debug/raw
+# Create writable directories for logs and synced catalog data
+RUN mkdir -p /app/logs/debug/raw /app/data
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

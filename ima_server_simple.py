@@ -6,8 +6,12 @@ IMA Copilot MCP 服务器 - 基于环境变量的简化版本
 
 import sys
 import asyncio
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
+from difflib import SequenceMatcher
+from typing import Any
 
 from fastmcp import FastMCP
 from mcp.types import TextContent
@@ -18,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from config import config_manager, get_config, get_app_config
 from ima_client import IMAAPIClient
+from models import KnowledgeBaseCatalogEntry
 
 # 配置详细的调试日志
 app_config = get_app_config()
@@ -57,6 +62,22 @@ _token_refreshed: bool = False  # 标记 token 是否已刷新
 _client_init_lock = asyncio.Lock()
 
 
+@dataclass
+class KnowledgeBaseQueryResult:
+    entry: KnowledgeBaseCatalogEntry
+    answer_text: str
+    response_blocks: list[TextContent]
+    reference_items: list[dict[str, Any]]
+    is_error: bool
+
+
+@dataclass
+class KnowledgeBaseCandidateResult:
+    query_result: KnowledgeBaseQueryResult
+    match_score: float
+    response_score: float
+
+
 def _validate_startup_config() -> tuple[bool, str]:
     """启动配置校验：缺少必需环境变量时阻止服务运行"""
     is_valid, error_message = config_manager.validate_config()
@@ -75,14 +96,551 @@ if not _startup_ok:
 def _get_knowledge_base_ids() -> list[str]:
     """获取当前配置中的知识库 ID 列表"""
     config = get_config()
-    if not config:
+    kb_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    if config:
+        for kb_id in (config.knowledge_base_ids or []):
+            if kb_id and kb_id not in seen_ids:
+                seen_ids.add(kb_id)
+                kb_ids.append(kb_id)
+
+    for entry in config_manager.get_knowledge_base_catalog_entries():
+        if entry.id and entry.id not in seen_ids:
+            seen_ids.add(entry.id)
+            kb_ids.append(entry.id)
+
+    return kb_ids
+
+
+def _get_knowledge_base_entries() -> list[KnowledgeBaseCatalogEntry]:
+    catalog_entries = config_manager.get_knowledge_base_catalog_entries()
+    if catalog_entries:
+        return catalog_entries
+
+    return [
+        KnowledgeBaseCatalogEntry(id=kb_id, name=kb_id, category="configured")
+        for kb_id in _get_knowledge_base_ids()
+    ]
+
+
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", (value or "").lower()).strip()
+
+
+def _tokenize_match_text(value: str) -> list[str]:
+    normalized_value = _normalize_match_text(value)
+    if not normalized_value:
+        return []
+    return re.findall(r"[\u4e00-\u9fff]+|[a-z0-9]+", normalized_value)
+
+
+def _score_knowledge_base_match(question: str, entry: KnowledgeBaseCatalogEntry) -> float:
+    question_text = _normalize_match_text(question)
+    if not question_text:
+        return 0.0
+
+    name_text = _normalize_match_text(entry.name)
+    description_text = _normalize_match_text(f"{entry.name} {entry.description or ''} {entry.introduction or ''}")
+    if not name_text:
+        return 0.0
+
+    score = 0.0
+    if name_text in question_text:
+        score += 10.0
+
+    question_tokens = set(_tokenize_match_text(question))
+    for token in _tokenize_match_text(entry.name):
+        if token in question_tokens:
+            score += 3.0
+        elif len(token) >= 2 and token in question_text:
+            score += 1.5
+
+    score += SequenceMatcher(None, question_text, name_text).ratio() * 2.5
+    if description_text:
+        score += SequenceMatcher(None, question_text, description_text).ratio()
+
+    return score
+
+
+def _rank_knowledge_base_candidates(
+    question: str,
+    *,
+    max_candidates: int = 3,
+) -> list[tuple[KnowledgeBaseCatalogEntry, float]]:
+    entries = _get_knowledge_base_entries()
+    if not entries:
         return []
 
-    kb_ids = [kb_id for kb_id in (config.knowledge_base_ids or []) if kb_id]
-    if kb_ids:
-        return kb_ids
+    if len(entries) == 1:
+        return [(entries[0], _score_knowledge_base_match(question, entries[0]))]
 
-    return [config.knowledge_base_id] if config.knowledge_base_id else []
+    ranked_entries = sorted(
+        ((entry, _score_knowledge_base_match(question, entry)) for entry in entries),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    top_score = ranked_entries[0][1]
+    if top_score < 3.0:
+        return ranked_entries[:max_candidates]
+
+    min_score = max(1.5, top_score * 0.55)
+    shortlisted_entries = [item for item in ranked_entries if item[1] >= min_score]
+    if not shortlisted_entries:
+        shortlisted_entries = ranked_entries[:1]
+
+    return shortlisted_entries[:max_candidates]
+
+
+def _select_knowledge_base_for_question(question: str) -> KnowledgeBaseCatalogEntry | None:
+    ranked_entries = _rank_knowledge_base_candidates(question, max_candidates=1)
+    if not ranked_entries:
+        return None
+
+    return ranked_entries[0][0]
+
+
+def _get_knowledge_base_entry_by_id(knowledge_base_id: str) -> KnowledgeBaseCatalogEntry:
+    for entry in _get_knowledge_base_entries():
+        if entry.id == knowledge_base_id:
+            return entry
+
+    return KnowledgeBaseCatalogEntry(id=knowledge_base_id, name=knowledge_base_id, category="configured")
+
+
+def _build_reference_block(
+    reference_items: list[dict[str, Any]],
+    *,
+    title: str = "### 📚 参考资料",
+) -> TextContent | None:
+    if not reference_items:
+        return None
+
+    grouped_items: dict[str, list[dict[str, Any]]] = {}
+    for item in reference_items:
+        source_name = str(item.get("knowledge_base") or "").strip() or "未标注知识库"
+        grouped_items.setdefault(source_name, []).append(item)
+
+    reference_lines = [title, ""]
+    for source_name, source_items in grouped_items.items():
+        reference_lines.append(f"#### 来源知识库：{source_name}")
+        reference_lines.append("")
+        for index, item in enumerate(source_items, 1):
+            item_title = str(item.get("title") or "未知标题").strip()
+            item_intro = str(item.get("introduction") or "").strip()
+
+            reference_lines.append(f"{index}. **{item_title}**")
+            if item_intro:
+                if len(item_intro) > 150:
+                    item_intro = item_intro[:150] + "..."
+                reference_lines.append(f"   > {item_intro}")
+            reference_lines.append("")
+
+    return TextContent(type="text", text="\n".join(reference_lines).strip())
+
+
+def _build_response_blocks(answer_text: str, reference_items: list[dict[str, Any]]) -> list[TextContent]:
+    content_list = [TextContent(type="text", text=answer_text)]
+    reference_block = _build_reference_block(reference_items)
+    if reference_block:
+        content_list.append(reference_block)
+    return content_list
+
+
+def _is_error_response_text(response_text: str) -> bool:
+    normalized_text = (response_text or "").strip()
+    if not normalized_text:
+        return True
+
+    if normalized_text.startswith("[ERROR]"):
+        return True
+
+    fallback_markers = (
+        "没有收到有效回复",
+        "没有收到任何响应",
+        "请求超时",
+        "认证失败",
+        "网络连接失败",
+        "询问失败",
+    )
+    return any(marker in normalized_text for marker in fallback_markers)
+
+
+def _summarize_answer_snippet(answer_text: str, *, max_length: int = 220) -> str:
+    paragraphs = [line.strip() for line in re.split(r"\n+", answer_text or "") if line.strip()]
+    if not paragraphs:
+        return ""
+
+    snippet = paragraphs[0]
+    if len(snippet) > max_length:
+        snippet = snippet[:max_length].rstrip() + "..."
+    return snippet
+
+
+def _score_reference_item_relevance(
+    question: str,
+    item: dict[str, Any],
+    *,
+    source_match_score: float,
+) -> float:
+    question_text = _normalize_match_text(question)
+    title_text = _normalize_match_text(str(item.get("title") or "").strip())
+    intro_text = _normalize_match_text(str(item.get("introduction") or "").strip())
+    source_text = _normalize_match_text(str(item.get("knowledge_base") or "").strip())
+    reference_text = _normalize_match_text(" ".join([title_text, intro_text, source_text]))
+    if not reference_text:
+        return 0.0
+
+    question_tokens = set(_tokenize_match_text(question))
+    title_tokens = set(_tokenize_match_text(title_text))
+    intro_tokens = set(_tokenize_match_text(intro_text))
+    reference_tokens = set(_tokenize_match_text(reference_text))
+
+    title_overlap = len(question_tokens & title_tokens)
+    intro_overlap = len(question_tokens & intro_tokens)
+    relevance_score = min(source_match_score * 0.2, 1.2)
+    relevance_score += min(title_overlap * 1.8, 5.4)
+    relevance_score += min(intro_overlap * 0.9, 2.7)
+    relevance_score += min(len(question_tokens & reference_tokens) * 0.3, 1.2)
+    if question_text:
+        relevance_score += SequenceMatcher(None, question_text, title_text or reference_text).ratio() * 2.6
+        relevance_score += SequenceMatcher(None, question_text, intro_text or reference_text).ratio() * 0.8
+
+    if title_overlap == 0 and SequenceMatcher(None, question_text, title_text or reference_text).ratio() < 0.2:
+        relevance_score -= 1.8
+
+    return relevance_score
+
+
+def _merge_reference_items(
+    question: str,
+    candidate_results: list[KnowledgeBaseCandidateResult],
+    *,
+    max_items: int = 8,
+    max_items_per_source: int = 3,
+    min_relevance_score: float = 1.8,
+) -> list[dict[str, Any]]:
+    merged_items: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    source_item_counts: dict[str, int] = {}
+    fallback_items: list[tuple[dict[str, Any], float]] = []
+
+    for candidate_result in sorted(candidate_results, key=lambda item: item.response_score, reverse=True):
+        scored_items = sorted(
+            (
+                (
+                    item,
+                    _score_reference_item_relevance(
+                        question,
+                        item,
+                        source_match_score=candidate_result.match_score,
+                    ),
+                )
+                for item in candidate_result.query_result.reference_items
+            ),
+            key=lambda scored_item: scored_item[1],
+            reverse=True,
+        )
+        if scored_items:
+            fallback_items.append(scored_items[0])
+        for item, relevance_score in scored_items:
+            dedupe_key = (
+                str(item.get("id") or "").strip(),
+                str(item.get("title") or "").strip(),
+            )
+            if dedupe_key in seen_keys:
+                continue
+
+            source_name = str(item.get("knowledge_base") or "").strip() or "未标注知识库"
+            if source_item_counts.get(source_name, 0) >= max_items_per_source:
+                continue
+
+            if relevance_score < min_relevance_score:
+                continue
+
+            seen_keys.add(dedupe_key)
+            merged_items.append(item)
+            source_item_counts[source_name] = source_item_counts.get(source_name, 0) + 1
+            if len(merged_items) >= max_items:
+                return merged_items
+
+    if merged_items:
+        return merged_items
+
+    for item, relevance_score in sorted(fallback_items, key=lambda scored_item: scored_item[1], reverse=True):
+        if relevance_score <= 0:
+            continue
+
+        dedupe_key = (
+            str(item.get("id") or "").strip(),
+            str(item.get("title") or "").strip(),
+        )
+        if dedupe_key in seen_keys:
+            continue
+
+        source_name = str(item.get("knowledge_base") or "").strip() or "未标注知识库"
+        if source_item_counts.get(source_name, 0) >= max_items_per_source:
+            continue
+
+        seen_keys.add(dedupe_key)
+        merged_items.append(item)
+        source_item_counts[source_name] = source_item_counts.get(source_name, 0) + 1
+        if len(merged_items) >= min(3, max_items):
+            break
+
+    return merged_items
+
+
+def _score_candidate_response(
+    question: str,
+    match_score: float,
+    query_result: KnowledgeBaseQueryResult,
+) -> float:
+    response_blocks = query_result.response_blocks
+    if not response_blocks:
+        return -100.0
+
+    combined_text = "\n".join(block.text.strip() for block in response_blocks if block.text).strip()
+    if not combined_text:
+        return -100.0
+
+    if query_result.is_error:
+        return -100.0
+
+    answer_text = query_result.answer_text.strip()
+    if not answer_text:
+        return -50.0
+
+    response_score = match_score * 1.2
+    response_score += min(len(answer_text) / 160.0, 4.0)
+
+    question_tokens = set(_tokenize_match_text(question))
+    answer_tokens = set(_tokenize_match_text(answer_text))
+    response_score += min(len(question_tokens & answer_tokens) * 0.8, 4.0)
+
+    if len(response_blocks) > 1 or "参考资料" in combined_text:
+        response_score += 2.5
+
+    if len(answer_text) < 20:
+        response_score -= 1.5
+
+    fallback_markers = (
+        "没有收到有效回复",
+        "没有收到任何响应",
+        "请求超时",
+        "认证失败",
+        "网络连接失败",
+        "询问失败",
+    )
+    if any(marker in combined_text for marker in fallback_markers):
+        response_score -= 8.0
+
+    weak_answer_markers = (
+        "未找到",
+        "没有找到",
+        "暂无",
+        "不清楚",
+    )
+    if any(marker in answer_text for marker in weak_answer_markers):
+        response_score -= 1.5
+
+    if query_result.entry.name and query_result.entry.name in answer_text:
+        response_score += 0.5
+
+    return response_score
+
+
+def _build_fused_candidate_response(
+    question: str,
+    candidate_results: list[KnowledgeBaseCandidateResult],
+) -> list[TextContent]:
+    best_result = max(candidate_results, key=lambda item: item.response_score)
+    successful_results = [
+        item for item in candidate_results
+        if not item.query_result.is_error and item.query_result.answer_text.strip()
+    ]
+    if not successful_results:
+        return best_result.query_result.response_blocks
+
+    primary_result = max(successful_results, key=lambda item: item.response_score)
+    supporting_results: list[KnowledgeBaseCandidateResult] = []
+    for item in successful_results:
+        if item.query_result.entry.id == primary_result.query_result.entry.id:
+            continue
+        if item.response_score < max(primary_result.response_score * 0.55, 2.5):
+            continue
+        similarity = SequenceMatcher(
+            None,
+            primary_result.query_result.answer_text,
+            item.query_result.answer_text,
+        ).ratio()
+        if similarity >= 0.96:
+            continue
+        supporting_results.append(item)
+
+    fused_results = [primary_result, *supporting_results[:2]]
+    merged_reference_items = _merge_reference_items(question, fused_results)
+
+    fused_source_names = "、".join(item.query_result.entry.name for item in fused_results)
+    answer_lines = [
+        f"以下内容综合了 {fused_source_names} 的检索结果。",
+        "",
+        primary_result.query_result.answer_text.strip(),
+    ]
+    if len(fused_results) > 1:
+        answer_lines.extend(["", "### 补充信息"])
+        for item in fused_results[1:]:
+            snippet = _summarize_answer_snippet(item.query_result.answer_text)
+            if not snippet:
+                continue
+            answer_lines.append(f"- 来自「{item.query_result.entry.name}」的补充结论: {snippet}")
+
+    fused_notice = TextContent(
+        type="text",
+        text=(
+            f"[知识库匹配] 已并行检索 {len(candidate_results)} 个候选知识库，"
+            f"融合 {len(fused_results)} 个候选库的结果，主结果来自「{primary_result.query_result.entry.name}」。"
+        ),
+    )
+    fused_answer_block = TextContent(type="text", text="\n".join(answer_lines).strip())
+
+    response_blocks = [fused_notice, fused_answer_block]
+    merged_reference_block = _build_reference_block(merged_reference_items, title="### 📚 合并参考资料")
+    if merged_reference_block:
+        response_blocks.append(merged_reference_block)
+    return response_blocks
+
+
+async def _query_target_kb(question: str, entry: KnowledgeBaseCatalogEntry) -> KnowledgeBaseQueryResult:
+    global ima_client
+
+    request_kb_id = entry.id.strip()
+    try:
+        logger.debug("发送问题", length=len(question), knowledge_base_id=request_kb_id)
+        mcp_safe_timeout = 300
+        messages = await ima_client.ask_question_complete(
+            question,
+            timeout=mcp_safe_timeout,
+            knowledge_base_id=request_kb_id,
+        )
+
+        if not messages:
+            logger.warning("⚠️ 未收到响应", knowledge_base_id=request_kb_id)
+            answer_text = "[ERROR] 没有收到任何响应，或者请求超时未产生任何输出"
+            return KnowledgeBaseQueryResult(
+                entry=entry,
+                answer_text=answer_text,
+                response_blocks=[TextContent(type="text", text=answer_text)],
+                reference_items=[],
+                is_error=True,
+            )
+
+        logger.info("-" * 80)
+        logger.info(f"完整 QA 结果 (知识库: {request_kb_id}, 原始消息列表):")
+        for index, message in enumerate(messages):
+            logger.info(f"  消息 {index + 1} (类型: {message.type.value}): {message.content[:200]}...")
+        logger.info("-" * 80)
+
+        answer_text = ima_client._extract_text_content(messages)
+        if not answer_text:
+            error_messages = [message.content for message in messages if message.type == 'system']
+            if error_messages:
+                answer_text = f"[ERROR] {'; '.join(error_messages)}"
+                logger.warning("⚠️ 未提取到文本，返回系统错误", error=answer_text, knowledge_base_id=request_kb_id)
+            else:
+                answer_text = "没有收到有效回复"
+
+        reference_items: list[dict[str, Any]] = []
+        try:
+            reference_items = ima_client._extract_knowledge_info(messages)
+            for reference_item in reference_items:
+                if not str(reference_item.get("knowledge_base") or "").strip():
+                    reference_item["knowledge_base"] = entry.name
+            if reference_items:
+                logger.debug("✅ 添加参考资料", count=len(reference_items), knowledge_base_id=request_kb_id)
+        except Exception as exc:
+            logger.warning(f"提取参考资料失败: {exc}", knowledge_base_id=request_kb_id)
+
+        response_blocks = _build_response_blocks(answer_text, reference_items)
+        logger.info("-" * 80)
+        logger.info(f"ask 工具返回内容 (知识库: {request_kb_id}, Block 数量: {len(response_blocks)}):")
+        for index, block in enumerate(response_blocks):
+            logger.info(f"Block {index + 1} ({len(block.text)} chars):\n{block.text[:200]}...")
+        logger.info("-" * 80)
+
+        return KnowledgeBaseQueryResult(
+            entry=entry,
+            answer_text=answer_text,
+            response_blocks=response_blocks,
+            reference_items=reference_items,
+            is_error=_is_error_response_text(answer_text),
+        )
+
+    except Exception as exc:
+        logger.exception("询问 IMA 时发生错误", knowledge_base_id=request_kb_id)
+        error_str = str(exc).lower()
+        if "超时" in str(exc) or "timeout" in error_str:
+            answer_text = "[ERROR] 请求超时，请稍后重试"
+        elif "认证" in str(exc) or "auth" in error_str:
+            answer_text = "[ERROR] 认证失败，请检查 IMA 配置信息"
+        elif "网络" in str(exc) or "network" in error_str or "connection" in error_str:
+            answer_text = "[ERROR] 网络连接失败，请检查网络设置"
+        else:
+            answer_text = f"[ERROR] 询问失败: {str(exc)}"
+
+        return KnowledgeBaseQueryResult(
+            entry=entry,
+            answer_text=answer_text,
+            response_blocks=[TextContent(type="text", text=answer_text)],
+            reference_items=[],
+            is_error=True,
+        )
+
+
+async def _ask_with_candidate_selection(
+    question: str,
+    candidates: list[tuple[KnowledgeBaseCatalogEntry, float]],
+) -> list[TextContent]:
+    async def _query_candidate(
+        entry: KnowledgeBaseCatalogEntry,
+        match_score: float,
+    ) -> KnowledgeBaseCandidateResult:
+        query_result = await _query_target_kb(question=question, entry=entry)
+        response_score = _score_candidate_response(question, match_score, query_result)
+        return KnowledgeBaseCandidateResult(
+            query_result=query_result,
+            match_score=match_score,
+            response_score=response_score,
+        )
+
+    candidate_tasks = [
+        _query_candidate(entry, match_score)
+        for entry, match_score in candidates
+    ]
+    candidate_results = await asyncio.gather(*candidate_tasks)
+    best_result = max(candidate_results, key=lambda item: item.response_score)
+
+    logger.info(
+        "✅ 候选知识库并发检索完成",
+        selected_knowledge_base_id=best_result.query_result.entry.id,
+        selected_knowledge_base_name=best_result.query_result.entry.name,
+        candidate_count=len(candidate_results),
+        selected_match_score=round(best_result.match_score, 3),
+        selected_response_score=round(best_result.response_score, 3),
+    )
+    logger.debug(
+        "候选知识库评分明细",
+        candidates=[
+            {
+                "knowledge_base_id": item.query_result.entry.id,
+                "knowledge_base_name": item.query_result.entry.name,
+                "match_score": round(item.match_score, 3),
+                "response_score": round(item.response_score, 3),
+            }
+            for item in candidate_results
+        ],
+    )
+    return _build_fused_candidate_response(question, candidate_results)
 
 
 def _is_multi_knowledge_base_mode() -> bool:
@@ -106,8 +664,6 @@ def _validate_knowledge_base_id(knowledge_base_id: str) -> tuple[bool, str]:
 
 async def _ask_with_target_kb(question: str, knowledge_base_id: str) -> list[TextContent]:
     """执行一次指定知识库的问答"""
-    global ima_client
-
     if not question or not question.strip():
         return [TextContent(type="text", text="[ERROR] 问题不能为空")]
 
@@ -115,93 +671,20 @@ async def _ask_with_target_kb(question: str, knowledge_base_id: str) -> list[Tex
     if not is_valid_kb_id:
         return [TextContent(type="text", text=kb_error)]
 
-    request_kb_id = knowledge_base_id.strip()
+    entry = _get_knowledge_base_entry_by_id(knowledge_base_id.strip())
+    query_result = await _query_target_kb(question=question, entry=entry)
+    return query_result.response_blocks
 
-    try:
-        logger.debug("发送问题", length=len(question), knowledge_base_id=request_kb_id)
 
-        # 增加超时时间以支持长回复
-        # 注意：某些 MCP 客户端（如 Claude Desktop）可能有自己的 60秒超时限制
-        mcp_safe_timeout = 300
+async def _sync_knowledge_bases() -> tuple[list[KnowledgeBaseCatalogEntry], str]:
+    global ima_client
 
-        # 将超时控制传递给 ask_question_complete，以便在超时时返回部分结果
-        messages = await ima_client.ask_question_complete(
-            question,
-            timeout=mcp_safe_timeout,
-            knowledge_base_id=request_kb_id,
-        )
+    if not await ensure_client_ready():
+        raise RuntimeError("IMA 客户端初始化或 token 刷新失败，请检查配置")
 
-        # 即使没有消息，也会返回包含错误信息的消息列表
-        if not messages:
-            logger.warning("⚠️ 未收到响应", knowledge_base_id=request_kb_id)
-            return [TextContent(type="text", text="[ERROR] 没有收到任何响应，或者请求超时未产生任何输出")]
-
-        # 打印完整的qa结果
-        logger.info("-" * 80)
-        logger.info(f"完整 QA 结果 (知识库: {request_kb_id}, 原始消息列表):")
-        for i, msg in enumerate(messages):
-            logger.info(f"  消息 {i + 1} (类型: {msg.type.value}): {msg.content[:200]}...")
-        logger.info("-" * 80)
-
-        response = ima_client._extract_text_content(messages)
-
-        # 如果没有提取到文本内容，检查是否有系统错误消息
-        if not response:
-            error_msgs = [msg.content for msg in messages if msg.type == 'system']
-            if error_msgs:
-                response = f"[ERROR] {'; '.join(error_msgs)}"
-                logger.warning("⚠️ 未提取到文本，返回系统错误", error=response, knowledge_base_id=request_kb_id)
-            else:
-                response = "没有收到有效回复"
-
-        logger.debug("✅ 获取响应", length=len(response), knowledge_base_id=request_kb_id)
-
-        content_list = [TextContent(type="text", text=response)]
-
-        # 提取并添加参考资料信息
-        try:
-            knowledge_info = ima_client._extract_knowledge_info(messages)
-            if knowledge_info:
-                ref_text = "### 📚 参考资料\n\n"
-                for i, item in enumerate(knowledge_info, 1):
-                    title = item.get('title', '未知标题')
-                    intro = item.get('introduction', '')
-                    # 截断过长的简介
-                    if intro and len(intro) > 150:
-                        intro = intro[:150] + "..."
-
-                    ref_text += f"{i}. **{title}**\n"
-                    if intro:
-                        ref_text += f"   > {intro}\n"
-                    ref_text += "\n"
-
-                content_list.append(TextContent(type="text", text=ref_text))
-                logger.debug("✅ 添加参考资料", count=len(knowledge_info), knowledge_base_id=request_kb_id)
-        except Exception as e:
-            logger.warning(f"提取参考资料失败: {e}", knowledge_base_id=request_kb_id)
-
-        # 打印返回 ask 的内容
-        logger.info("-" * 80)
-        logger.info(f"ask 工具返回内容 (知识库: {request_kb_id}, Block 数量: {len(content_list)}):")
-        for i, block in enumerate(content_list):
-            logger.info(f"Block {i+1} ({len(block.text)} chars):\n{block.text[:200]}...")
-        logger.info("-" * 80)
-
-        return content_list
-
-    except Exception as e:
-        logger.exception("询问 IMA 时发生错误", knowledge_base_id=request_kb_id)
-
-        # 返回更友好的错误信息
-        error_str = str(e).lower()
-        if "超时" in str(e) or "timeout" in error_str:
-            return [TextContent(type="text", text="[ERROR] 请求超时，请稍后重试")]
-        elif "认证" in str(e) or "auth" in error_str:
-            return [TextContent(type="text", text="[ERROR] 认证失败，请检查 IMA 配置信息")]
-        elif "网络" in str(e) or "network" in error_str or "connection" in error_str:
-            return [TextContent(type="text", text="[ERROR] 网络连接失败，请检查网络设置")]
-        else:
-            return [TextContent(type="text", text=f"[ERROR] 询问失败: {str(e)}")]
+    entries = await ima_client.fetch_knowledge_base_catalog()
+    config_manager.persist_knowledge_base_catalog(entries)
+    return entries, config_manager.get_catalog_file_path()
 
 
 # @mcp.on_shutdown()
@@ -292,13 +775,21 @@ async def ask(question: str) -> list[TextContent]:
         if not await ensure_client_ready():
             return [TextContent(type="text", text="[ERROR] IMA 客户端初始化或 token 刷新失败，请检查配置")]
 
-        if _is_multi_knowledge_base_mode():
+        entries = _get_knowledge_base_entries()
+        if not entries:
+            try:
+                entries, _ = await _sync_knowledge_bases()
+            except Exception as exc:
+                return [TextContent(type="text", text=f"[ERROR] 暂无可用知识库，请先执行 sync_knowledge_bases: {exc}")]
+
+        has_catalog_names = any(entry.name and entry.name != entry.id for entry in entries)
+        if _is_multi_knowledge_base_mode() and not has_catalog_names:
             kb_ids = _get_knowledge_base_ids()
             return [
                 TextContent(
                     type="text",
                     text=(
-                        "[ERROR] 当前为多知识库模式，请使用 ask_with_kb 并传入 knowledge_base_id。"
+                        "[ERROR] 当前为多知识库模式，但尚未同步知识库名称，请先执行 sync_knowledge_bases，或改用 ask_with_kb 并传入 knowledge_base_id。"
                         f"可用值: {', '.join(kb_ids)}"
                     ),
                 )
@@ -306,8 +797,25 @@ async def ask(question: str) -> list[TextContent]:
 
         logger.debug("🔍 ask 工具调用", question_preview=question[:50])
 
-        default_kb_id = _get_knowledge_base_ids()[0]
-        return await _ask_with_target_kb(question=question, knowledge_base_id=default_kb_id)
+        ranked_candidates = _rank_knowledge_base_candidates(question)
+        if not ranked_candidates:
+            return [TextContent(type="text", text="[ERROR] 未找到可用知识库，请先执行 sync_knowledge_bases")]
+
+        if len(ranked_candidates) == 1:
+            selected_entry, _ = ranked_candidates[0]
+            logger.info(
+                "✅ 自动匹配知识库",
+                knowledge_base_id=selected_entry.id,
+                knowledge_base_name=selected_entry.name,
+            )
+            return await _ask_with_target_kb(question=question, knowledge_base_id=selected_entry.id)
+
+        logger.info(
+            "🔀 启用多候选知识库检索",
+            candidate_count=len(ranked_candidates),
+            candidate_names=[entry.name for entry, _ in ranked_candidates],
+        )
+        return await _ask_with_candidate_selection(question=question, candidates=ranked_candidates)
 
 
 @mcp.tool()
@@ -336,6 +844,34 @@ async def ask_with_kb(question: str, knowledge_base_id: str) -> list[TextContent
         return await _ask_with_target_kb(question=question, knowledge_base_id=knowledge_base_id)
 
 
+@mcp.tool()
+async def sync_knowledge_bases() -> list[TextContent]:
+    """同步 IMA 个人/共享知识库目录，并写入本地配置文件"""
+    try:
+        entries, catalog_file = await _sync_knowledge_bases()
+    except Exception as exc:
+        logger.exception("同步知识库目录失败")
+        return [TextContent(type="text", text=f"[ERROR] 同步知识库目录失败: {exc}")]
+
+    grouped_entries: dict[str, list[KnowledgeBaseCatalogEntry]] = {}
+    for entry in entries:
+        grouped_entries.setdefault(entry.category, []).append(entry)
+
+    response_lines = [
+        f"已同步 {len(entries)} 个知识库。",
+        f"目录文件: {catalog_file}",
+        "",
+    ]
+    for category, category_entries in grouped_entries.items():
+        response_lines.append(f"[{category}]")
+        for entry in category_entries:
+            response_lines.append(f"- {entry.name} ({entry.id})")
+        response_lines.append("")
+
+    response_lines.append("已自动写回 .env 中的 IMA_KNOWLEDGE_BASE_ID / IMA_KNOWLEDGE_BASE_IDS。")
+    return [TextContent(type="text", text="\n".join(response_lines).strip())]
+
+
 @mcp.resource("ima://config")
 def get_config_resource() -> str:
     """获取当前配置信息（不包含敏感数据）"""
@@ -350,6 +886,7 @@ def get_config_resource() -> str:
         config_info += f"默认知识库ID: {config.knowledge_base_id}\n"
         config_info += f"可用知识库ID: {', '.join(config.knowledge_base_ids)}\n"
         config_info += f"知识库模式: {'多知识库' if len(config.knowledge_base_ids) > 1 else '单知识库'}\n"
+        config_info += f"知识库目录文件: {config_manager.get_catalog_file_path()}\n"
         config_info += f"请求超时: {config.timeout}秒\n"
         config_info += f"重试次数: {config.retry_count}\n"
         config_info += f"代理设置: {config.proxy or '未设置'}\n"
@@ -385,6 +922,7 @@ def get_help_resource() -> str:
 ## 工具
 - `ask`: 向 IMA 知识库询问问题
 - `ask_with_kb`: 向指定知识库询问问题（多知识库模式推荐）
+- `sync_knowledge_bases`: 自动同步个人/共享知识库目录并写入本地配置
 
 ## 资源
 - `ima://config`: 查看配置信息

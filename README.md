@@ -9,10 +9,13 @@
 - 🔧 **环境变量配置**: 通过 `.env` 文件管理所有配置
 - 📡 **HTTP 传输**: 支持 HTTP 传输协议，便于 MCP Inspector 连接
 - 🛠️ **增强型 MCP 工具**: 提供腾讯 IMA 知识库问答功能，返回结果包含回答文本和结构化参考资料
+- 🗂️ **知识库目录同步**: 自动拉取个人/共享知识库名称与 ID，并持久化到本地配置文件
+- 🧠 **自动选库与多候选融合**: `ask(question)` 会自动匹配多个候选知识库，并融合最相关的回答
+- 📚 **分组参考资料**: 合并后的参考资料会按知识库来源分组展示，并过滤明显不相关的条目
 - 🔄 **Token 自动刷新**: 智能管理认证 token，自动刷新保持会话有效
 - 💪 **Tenacity-powered Retries**: 集成 tenacity 库，优化重试机制，支持指数退避和针对性错误重试
 - 🧯 **Code=3 自愈**: 对高并发瞬时 `Code=3` 错误执行退避重试并自动恢复
-- 🚦 **并发限流**: 默认串行问答（并发=1），降低请求突发导致的系统错误
+- 🚦 **并发限流**: 默认低并发问答（并发=2），兼顾多候选检索与系统稳定性
 - 📝 **Loguru-enhanced Logging**: 采用 Loguru 提升日志体验，提供更清晰、结构化的日志输出
 - ⏱️ **超时保护**: 内置请求超时机制，防止长时间阻塞 (已提升至 300 秒)
 - 🎯 **一键启动**: 简化的启动流程，自动环境检查和配置验证
@@ -40,7 +43,9 @@ docker run -d \
   -p 8081:8081 \
   -e IMA_X_IMA_COOKIE="your_x_ima_cookie_here" \
   -e IMA_X_IMA_BKN="your_x_ima_bkn_here" \
+  -e IMA_KNOWLEDGE_BASE_CATALOG_FILE="/app/data/.ima_knowledge_bases.json" \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/data:/app/data \
   --restart unless-stopped \
   highkay/tencent-ima-copilot-mcp:latest
 
@@ -56,6 +61,7 @@ docker logs -f ima-copilot-mcp
 # .env 文件
 IMA_X_IMA_COOKIE="your_x_ima_cookie_here"
 IMA_X_IMA_BKN="your_x_ima_bkn_here"
+IMA_KNOWLEDGE_BASE_CATALOG_FILE="/app/data/.ima_knowledge_bases.json"
 ```
 
 启动服务：
@@ -162,12 +168,13 @@ npx @modelcontextprotocol/inspector
 **特性:**
 - 自动管理会话，无需手动创建
 - 智能 token 刷新，确保认证有效
-- 内置并发限流（默认 `IMA_ASK_CONCURRENCY_LIMIT=1`）
+- 内置并发限流（默认 `IMA_ASK_CONCURRENCY_LIMIT=2`）
 - 检测到 `Code=3` 且无文本时自动指数退避重试（最多 2 次）
 - **300 秒超时保护**，防止长时间等待
-- 返回内容为 **`TextContent` 列表**，包含**回答文本**和格式化后的**参考资料**
+- 多知识库模式下会自动选择多个候选知识库并融合结果
+- 返回内容为 **`TextContent` 列表**，包含**融合后的回答文本**和按知识库分组后的**参考资料**
 
-> 注意：当配置了多个知识库 ID 时，`ask` 会直接报错并提示改用 `ask_with_kb`。
+> 注意：如果尚未同步知识库目录，`ask` 会先尝试使用本地目录；必要时请先执行 `sync_knowledge_bases`。
 
 ### 2. `ask_with_kb`
 
@@ -182,6 +189,15 @@ npx @modelcontextprotocol/inspector
 问题: "总结这个知识库的核心内容"
 knowledge_base_id: "7305806844290061"
 ```
+
+### 3. `sync_knowledge_bases`
+
+同步 IMA 个人/共享知识库目录，并写入本地目录文件。
+
+**效果:**
+- 自动发现当前账号可见的个人/共享知识库
+- 持久化 `id -> name` 映射到 `IMA_KNOWLEDGE_BASE_CATALOG_FILE`
+- 自动回写 `.env` 中的 `IMA_KNOWLEDGE_BASE_ID` 和 `IMA_KNOWLEDGE_BASE_IDS`
 
 ## 可用的 MCP 资源
 
@@ -206,24 +222,38 @@ knowledge_base_id: "7305806844290061"
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `IMA_KNOWLEDGE_BASE_ID` / `knowledgeBaseId` | 单知识库 ID（两者等价） | 无（必须显式配置） |
+| `IMA_KNOWLEDGE_BASE_ID` / `knowledgeBaseId` | 单知识库 ID（两者等价） | 无 |
 | `IMA_KNOWLEDGE_BASE_IDS` / `knowledgeBaseIds` | 多知识库 ID 列表（逗号分隔） | 无 |
+| `IMA_KNOWLEDGE_BASE_CATALOG_FILE` / `knowledgeBaseCatalogFile` | 知识库目录文件路径 | `.ima_knowledge_bases.json` |
 | `IMA_MCP_HOST` | MCP 服务器地址 | `127.0.0.1` |
 | `IMA_MCP_PORT` | MCP 服务器端口 | `8081` |
 | `IMA_MCP_LOG_LEVEL` | 日志级别 (支持 `DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
 | `IMA_REQUEST_TIMEOUT` | IMA API 请求超时时间（秒） | `30` |
 | `IMA_RETRY_COUNT` | 网络/超时类异常重试次数 | `3` |
-| `IMA_ASK_CONCURRENCY_LIMIT` | 问答并发上限（建议 1-2） | `1` |
+| `IMA_ASK_CONCURRENCY_LIMIT` | 问答并发上限（建议 2-3） | `2` |
 | `IMA_ROBOT_TYPE` | 机器人类型 | `5` |
 | `IMA_SCENE_TYPE` | 场景类型 | `1` |
 | `IMA_MODEL_TYPE` | 模型类型 | `4` |
 
 ### 知识库配置模式
 
-- 单知识库模式（兼容旧逻辑）：配置 `IMA_KNOWLEDGE_BASE_ID`（或 `knowledgeBaseId`），使用 `ask` 或 `ask_with_kb` 均可。
-- 多知识库模式：配置 `IMA_KNOWLEDGE_BASE_IDS`（或 `knowledgeBaseIds`，逗号分隔），必须使用 `ask_with_kb`。
-- 同时配置两者时：优先使用 `IMA_KNOWLEDGE_BASE_ID`（单知识库模式）。
-- 启动强校验：若 `IMA_KNOWLEDGE_BASE_ID` 与 `IMA_KNOWLEDGE_BASE_IDS` 都未配置，服务将直接退出。
+- 单知识库模式：配置 `IMA_KNOWLEDGE_BASE_ID`（或 `knowledgeBaseId`），`ask` 和 `ask_with_kb` 都可以直接使用。
+- 多知识库模式：配置 `IMA_KNOWLEDGE_BASE_IDS`（或 `knowledgeBaseIds`，逗号分隔），`ask` 会自动选库并融合候选结果，`ask_with_kb` 可用于强制指定单库。
+- 认证优先模式：只配置 `IMA_X_IMA_COOKIE` 和 `IMA_X_IMA_BKN` 也可以启动；首次执行 `sync_knowledge_bases` 后会自动同步知识库目录。
+- 同时配置单库和多库时：优先使用 `IMA_KNOWLEDGE_BASE_ID` 作为默认库，但 `ask` 仍会优先参考已同步目录进行自动匹配。
+
+### 自动同步与自动选库
+
+1. 启动服务后先执行 `sync_knowledge_bases`
+2. 服务会从 `https://ima.qq.com/wikis` 对应接口拉取个人/共享知识库清单
+3. 同步结果会保存知识库 `id -> name` 映射，后续 `ask(question)` 会根据问题和知识库名称的相关性自动选择多个候选知识库
+4. 服务会并发检索候选知识库，融合最相关的回答，并输出按知识库来源分组的参考资料
+
+### Docker 持久化建议
+
+- 建议为 `IMA_KNOWLEDGE_BASE_CATALOG_FILE` 指定容器内持久化路径，例如 `/app/data/.ima_knowledge_bases.json`
+- 建议挂载 `./data:/app/data`，这样 `sync_knowledge_bases` 生成的目录文件在容器重建后仍会保留
+- 如果希望容器内自动回写的 `.env` 也保留到宿主机，可额外挂载项目根目录下的 `.env` 到 `/app/.env`
 
 ### 从旧版本迁移
 
@@ -250,6 +280,12 @@ A:
 3. 查看 Payload 中的 `knowledge_base_id`
 
 **Q: 多知识库怎么配置和调用？**
+
+A:
+1. 最简单的方式是只配置 `IMA_X_IMA_COOKIE` 和 `IMA_X_IMA_BKN`
+2. 启动后执行 `sync_knowledge_bases`
+3. 后续直接使用 `ask(question)`，服务会自动选库、并发检索候选库，并融合回答
+4. 如果要强制指定某个库，再使用 `ask_with_kb(question, knowledge_base_id)`
 
 A:
 1. 在 `.env` 中设置 `IMA_KNOWLEDGE_BASE_IDS=id1,id2,id3`

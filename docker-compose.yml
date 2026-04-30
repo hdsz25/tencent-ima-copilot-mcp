@@ -12,7 +12,10 @@ services:
       # 从浏览器开发者工具获取（详见 README.md）
       IMA_X_IMA_COOKIE: "${IMA_X_IMA_COOKIE}"
       IMA_X_IMA_BKN: "${IMA_X_IMA_BKN}"
-      IMA_KNOWLEDGE_BASE_ID: "${IMA_KNOWLEDGE_BASE_ID}"
+      # 知识库 ID 可选；也可以仅凭认证信息启动后执行 sync_knowledge_bases 自动发现
+      IMA_KNOWLEDGE_BASE_ID: "${IMA_KNOWLEDGE_BASE_ID:-}"
+      IMA_KNOWLEDGE_BASE_IDS: "${IMA_KNOWLEDGE_BASE_IDS:-}"
+      IMA_KNOWLEDGE_BASE_CATALOG_FILE: "${IMA_KNOWLEDGE_BASE_CATALOG_FILE:-/app/data/.ima_knowledge_bases.json}"
 
       # ===== 可选配置（已有默认值）=====
       # 完整的 Cookie 字符串（可选）
@@ -31,6 +34,7 @@ services:
       # API 配置
       IMA_REQUEST_TIMEOUT: "${IMA_REQUEST_TIMEOUT:-30}"
       IMA_RETRY_COUNT: "${IMA_RETRY_COUNT:-3}"
+      IMA_ASK_CONCURRENCY_LIMIT: "${IMA_ASK_CONCURRENCY_LIMIT:-2}"
 
       # 代理设置（可选）
       # IMA_PROXY: "${IMA_PROXY:-}"
@@ -41,6 +45,9 @@ services:
     # 持久化日志
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
+      # 如果希望容器内 sync_knowledge_bases 回写的 .env 也持久化，可取消下面注释
+      # - ./.env:/app/.env
 
     # Health check
     healthcheck:

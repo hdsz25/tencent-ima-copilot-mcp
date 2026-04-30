@@ -35,6 +35,7 @@ from models import (
     IMAMessage,
     MessageType,
     KnowledgeBaseMessage,
+    KnowledgeBaseCatalogEntry,
     TextMessage,
     MediaInfo,
     DeviceInfo,
@@ -68,6 +69,7 @@ class IMAAPIClient:
         self.api_endpoint = "/cgi-bin/assistant/qa"
         self.refresh_endpoint = "/cgi-bin/auth_login/refresh"
         self.init_session_endpoint = "/cgi-bin/session_logic/init_session"
+        self.knowledge_base_list_endpoint = "/cgi-bin/knowledge_tab_reader/get_home_page_data"
         self.session: Optional[aiohttp.ClientSession] = None
         self.raw_log_dir: Optional[Path] = None
         self._token_lock = asyncio.Lock()  # 保护 token 刷新过程
@@ -446,6 +448,139 @@ class IMAAPIClient:
         """关闭客户端会话"""
         if self.session and not self.session.closed:
             await self.session.close()
+
+    async def _post_json(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        *,
+        require_auth: bool = True,
+    ) -> Dict[str, Any]:
+        if require_auth and not await self.ensure_valid_token():
+            raise AuthenticationError(self._build_auth_error_message())
+
+        session = await self._get_session()
+        headers = self._build_headers(for_init_session=True, include_authorization=require_auth)
+
+        async with session.post(
+            f"{self.base_url}{endpoint}",
+            json=payload,
+            headers=headers,
+        ) as response:
+            response_text = await response.text()
+            if response.status != 200:
+                raise ValueError(f"HTTP {response.status}: {response_text[:500]}")
+
+            try:
+                return json.loads(response_text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"JSON parse failed: {exc}") from exc
+
+    @staticmethod
+    def _categorize_knowledge_base(group_name: str) -> str:
+        normalized_group_name = (group_name or "").strip()
+        if "共享" in normalized_group_name:
+            return "shared"
+        if "我加入" in normalized_group_name:
+            return "shared"
+        if "个人" in normalized_group_name or "我的" in normalized_group_name:
+            return "personal"
+        if "我创建" in normalized_group_name:
+            return "personal"
+        if "订阅" in normalized_group_name:
+            return "subscribed"
+        return "unknown"
+
+    def _parse_knowledge_base_catalog_entries(self, response_data: Dict[str, Any]) -> List[KnowledgeBaseCatalogEntry]:
+        code = response_data.get("code", -1)
+        if code != 0:
+            raise ValueError(f"知识库目录接口返回异常 code={code}, msg={response_data.get('msg', '')}")
+
+        results = response_data.get("results")
+        if not isinstance(results, list):
+            raise ValueError("知识库目录响应缺少 results 列表")
+
+        entries: List[KnowledgeBaseCatalogEntry] = []
+        seen_ids: set[str] = set()
+        for group in results:
+            if not isinstance(group, dict):
+                continue
+
+            group_name = str(group.get("knowledgeBaseListName") or group.get("knowledge_base_list_name") or "").strip()
+            group_type = group.get("type")
+            knowledge_base_list = group.get("knowledgeBaseList") or group.get("knowledge_base_list") or []
+            if not isinstance(knowledge_base_list, list):
+                continue
+
+            for item in knowledge_base_list:
+                if not isinstance(item, dict):
+                    continue
+
+                basic_info = item.get("basicInfo") or item.get("basic_info") or {}
+                kb_id = str(item.get("id") or item.get("knowledgeBaseId") or "").strip()
+                kb_name = str(basic_info.get("name") or item.get("name") or "").strip()
+                if not kb_id or not kb_name or kb_id in seen_ids:
+                    continue
+
+                seen_ids.add(kb_id)
+                entries.append(
+                    KnowledgeBaseCatalogEntry(
+                        id=kb_id,
+                        name=kb_name,
+                        category=self._categorize_knowledge_base(group_name),
+                        group_name=group_name or None,
+                        type=group_type if isinstance(group_type, int) else None,
+                        description=str(basic_info.get("description") or "").strip() or None,
+                        introduction=str(item.get("introduction") or basic_info.get("introduction") or "").strip() or None,
+                        permission_type=item.get("permissionType") if isinstance(item.get("permissionType"), int) else item.get("permission_type") if isinstance(item.get("permission_type"), int) else None,
+                    )
+                )
+
+        if not entries:
+            raise ValueError("知识库目录响应中未解析到任何知识库")
+
+        return entries
+
+    async def fetch_knowledge_base_catalog(self) -> List[KnowledgeBaseCatalogEntry]:
+        payload_candidates: List[Dict[str, Any]] = [
+            {
+                "need_folder_number": True,
+                "need_first_knowledge_base": True,
+                "knowledge_list_req": {
+                    "need_default_cover": False,
+                    "sort_type": 9,
+                    "limit": 50,
+                    "cursor": "",
+                },
+                "knowledge_base_list_req": {
+                    "params": [
+                        {"type": 1001, "cursor": "", "limit": 20},
+                        {"type": 1002, "cursor": "", "limit": 20},
+                        {"type": 1004, "cursor": "", "limit": 20},
+                        {"type": 1005, "cursor": "", "limit": 50},
+                    ]
+                },
+            },
+            {},
+            {"cursor": "", "limit": 100},
+            {"cursor": "", "pageLimit": 100},
+            {"cursor": "", "pageSize": 100},
+            {"limit": 100},
+            {"pageLimit": 100},
+        ]
+        last_error: Optional[Exception] = None
+
+        for payload in payload_candidates:
+            try:
+                response_data = await self._post_json(self.knowledge_base_list_endpoint, payload)
+                entries = self._parse_knowledge_base_catalog_entries(response_data)
+                logger.info(f"✅ 获取知识库目录成功，共 {len(entries)} 个知识库")
+                return entries
+            except Exception as exc:
+                last_error = exc
+                logger.debug(f"知识库目录请求失败，payload={payload}: {exc}")
+
+        raise ValueError(f"获取知识库目录失败: {last_error}")
 
     def _generate_session_id(self) -> str:
         """生成会话 ID"""
