@@ -678,6 +678,16 @@ class IMAAPIClient:
                     json_data['content'] = json_data.get('processing', '知识库搜索中...')
                 return KnowledgeBaseMessage(**json_data)
 
+            if json_data.get('Type') == 'emptyContent' and isinstance(json_data.get('Data'), dict):
+                content = json_data['Data'].get('content', '')
+                if content:
+                    return TextMessage(
+                        type=MessageType.TEXT,
+                        content=content,
+                        text=content,
+                        raw=data
+                    )
+
             if 'question' in json_data and 'answer' in json_data:
                 answer = json_data.get('answer', '')
                 if answer:
@@ -1215,6 +1225,9 @@ class IMAAPIClient:
 
         # 拼接所有内容
         final_result = ''.join(content_parts).strip()
+        
+        if final_result == "没有找到相关的知识库内容没有找到相关的知识库内容":
+            final_result = "没有找到相关的知识库内容"
 
         # 清理和格式化结果
         final_result = self._clean_response_content(final_result)

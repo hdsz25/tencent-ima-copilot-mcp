@@ -2,10 +2,13 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+.ima_knowledge_bases.json
 # C extensions
 *.so
-
+docker_data/
+data/
+chromadb/
+logs/
 # Distribution / packaging
 .Python
 build/

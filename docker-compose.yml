@@ -2,9 +2,10 @@ version: '3.8'
 
 services:
   ima-mcp-server:
-    image: highkay/tencent-ima-copilot-mcp:latest
+    image: tencent-ima-copilot-mcp:test
     container_name: ima-copilot-mcp
     restart: unless-stopped
+    network_mode: "host"
 
     # Required environment variables - MUST be provided
     environment:
@@ -29,23 +30,30 @@ services:
       IMA_MCP_HOST: "0.0.0.0"
       IMA_MCP_PORT: "8081"
       IMA_MCP_DEBUG: "${IMA_MCP_DEBUG:-false}"
-      IMA_MCP_LOG_LEVEL: "${IMA_MCP_LOG_LEVEL:-INFO}"
+      IMA_MCP_LOG_LEVEL: "${IMA_MCP_LOG_LEVEL:-ERROR}"
 
       # API 配置
       IMA_REQUEST_TIMEOUT: "${IMA_REQUEST_TIMEOUT:-30}"
       IMA_RETRY_COUNT: "${IMA_RETRY_COUNT:-3}"
       IMA_ASK_CONCURRENCY_LIMIT: "${IMA_ASK_CONCURRENCY_LIMIT:-2}"
+      
+      # Ollama服务配置，当 network_mode: "host" 时，可以安全地使用 127.0.0.1
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://127.0.0.1:11434}"
 
       # 代理设置（可选）
       # IMA_PROXY: "${IMA_PROXY:-}"
 
-    ports:
-      - "8081:8081"
+    # ports:
+    #   - "8081:8081"
+      
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
 
-    # 持久化日志
+    # 持久化日志和数据
     volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
+      - ./docker_data/logs:/app/logs
+      - ./docker_data/data:/app/data
+      - ./docker_data/chromadb:/app/chromadb
       # 如果希望容器内 sync_knowledge_bases 回写的 .env 也持久化，可取消下面注释
       # - ./.env:/app/.env
 

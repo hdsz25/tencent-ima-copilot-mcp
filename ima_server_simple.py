@@ -7,6 +7,69 @@ IMA Copilot MCP 服务器 - 基于环境变量的简化版本
 import sys
 import asyncio
 import re
+
+from llama_index.core import QueryBundle, Document, VectorStoreIndex, StorageContext, Settings, SimpleKeywordTableIndex
+from llama_index.core.schema import NodeWithScore
+from llama_index.core.retrievers import BaseRetriever, VectorIndexRetriever, KeywordTableSimpleRetriever
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.embeddings.ollama import OllamaEmbedding
+import chromadb
+from typing import List
+import os
+
+class HybridRetriever(BaseRetriever):
+    """支持AND/OR模式的混合检索器，实现语义与关键词检索结果的集合运算"""
+    def __init__(
+        self,
+        vector_retriever: VectorIndexRetriever,
+        keyword_retriever: KeywordTableSimpleRetriever,
+        mode: str = "AND"  # 默认使用交集模式，精确性优先
+    ) -> None:
+        self._vector_retriever = vector_retriever
+        self._keyword_retriever = keyword_retriever
+        if mode not in ("AND", "OR"):
+            raise ValueError("仅支持AND/OR检索模式，当前模式无效")
+        self._mode = mode
+        super().__init__()
+    
+    def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        """核心检索逻辑：执行双检索器查询并按模式合并结果"""
+        # 1. 分别执行向量检索和关键词检索
+        vector_nodes = self._vector_retriever.retrieve(query_bundle)
+        keyword_nodes = self._keyword_retriever.retrieve(query_bundle)
+        
+        # 2. 提取节点ID用于集合运算
+        vector_ids = {n.node.node_id for n in vector_nodes}
+        keyword_ids = {n.node.node_id for n in keyword_nodes}
+        
+        # 3. 合并节点到字典，便于通过ID快速查找
+        combined_dict = {n.node.node_id: n for n in vector_nodes}
+        combined_dict.update({n.node.node_id: n for n in keyword_nodes})
+        
+        # 4. 根据模式执行集合运算（交集或并集）
+        if self._mode == "AND":
+            # 仅返回同时满足向量相似和关键词匹配的节点
+            retrieve_ids = vector_ids.intersection(keyword_ids)
+        else:
+            # 返回满足任意条件的节点
+            retrieve_ids = vector_ids.union(keyword_ids)
+        
+        # 5. 根据最终ID集合获取检索结果
+        return sorted([combined_dict[rid] for rid in retrieve_ids], key=lambda x: x.score or 0.0, reverse=True)
+
+# 配置 LlamaIndex 默认 embedding (Ollama)
+from llama_index.core.llms import MockLLM
+import os
+
+def _get_default_ollama_host():
+    if os.path.exists('/.dockerenv'):
+        return "http://host.docker.internal:11434"
+    return "http://127.0.0.1:11434"
+
+ollama_host = os.environ.get("OLLAMA_HOST") or _get_default_ollama_host()
+Settings.embed_model = OllamaEmbedding(model_name="embeddinggemma:latest", base_url=ollama_host)
+Settings.llm = MockLLM(max_tokens=256)
+
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
@@ -39,12 +102,12 @@ log_file = log_dir / f"ima_server_{timestamp}.log"
 logger.remove()  # 移除默认的 sink
 logger.add(
     sys.stderr,
-    level="INFO",
+    level=app_config.log_level,
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level> | <magenta>{extra}</magenta>"
 )
 logger.add(
     log_file,
-    level="DEBUG",
+    level=app_config.log_level,
     rotation="10 MB",
     retention="1 week",
     encoding="utf-8",
@@ -135,35 +198,10 @@ def _tokenize_match_text(value: str) -> list[str]:
     return re.findall(r"[\u4e00-\u9fff]+|[a-z0-9]+", normalized_value)
 
 
-def _score_knowledge_base_match(question: str, entry: KnowledgeBaseCatalogEntry) -> float:
-    question_text = _normalize_match_text(question)
-    if not question_text:
-        return 0.0
-
-    name_text = _normalize_match_text(entry.name)
-    description_text = _normalize_match_text(f"{entry.name} {entry.description or ''} {entry.introduction or ''}")
-    if not name_text:
-        return 0.0
-
-    score = 0.0
-    if name_text in question_text:
-        score += 10.0
-
-    question_tokens = set(_tokenize_match_text(question))
-    for token in _tokenize_match_text(entry.name):
-        if token in question_tokens:
-            score += 3.0
-        elif len(token) >= 2 and token in question_text:
-            score += 1.5
-
-    score += SequenceMatcher(None, question_text, name_text).ratio() * 2.5
-    if description_text:
-        score += SequenceMatcher(None, question_text, description_text).ratio()
-
-    return score
 
 
-def _rank_knowledge_base_candidates(
+
+async def _rank_knowledge_base_candidates(
     question: str,
     *,
     max_candidates: int = 3,
@@ -172,32 +210,56 @@ def _rank_knowledge_base_candidates(
     if not entries:
         return []
 
+    # 尝试从 ChromaDB 调用 HybridRetriever 进行检索
+    db_path = str(Path(config_manager._workspace_root) / "chromadb")
+    ranked_entries = []
+    
+    if os.path.exists(db_path):
+        from llama_index.core import load_index_from_storage
+        try:
+            chroma_client = chromadb.PersistentClient(path=db_path)
+            chroma_collection = chroma_client.get_or_create_collection("kb_collection")
+            vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+            
+            # 从存储加载索引
+            vector_index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
+            
+            storage_context_kw = StorageContext.from_defaults(persist_dir=str(Path(db_path) / "keyword_index"))
+            kw_index = load_index_from_storage(storage_context_kw)
+            
+            # 也可以直接用 hybrid_query_engine.query ，但提取节点并打分更符合当前架构
+            # 因为我们需要 entry metadata
+            retriever = HybridRetriever(
+                vector_retriever=vector_index.as_retriever(similarity_top_k=max_candidates * 5),
+                keyword_retriever=kw_index.as_retriever(similarity_top_k=max_candidates * 5),
+                mode="OR"  # 因为搜索短句容易没有共现词汇，采用OR更宽松
+            )
+            
+            query_bundle = QueryBundle(f"查询问题：{question}")
+            nodes = retriever.retrieve(query_bundle)
+            
+            entry_dict = {e.id: e for e in entries}
+            seen_kbs = set()
+            for n in nodes:
+                kb_id = n.node.metadata.get("entry_id") or n.node.ref_doc_id
+                if kb_id in entry_dict and kb_id not in seen_kbs:
+                    score = n.score or 0.0
+                    ranked_entries.append((entry_dict[kb_id], score))
+                    seen_kbs.add(kb_id)
+                    
+            if ranked_entries:
+                return ranked_entries[:max_candidates]
+                
+        except Exception as e:
+            logger.warning(f"HybridRetriever / ChromaDB 检索异常: {e}")
+
+    # Fallback 如果混合检索失败且只有一个库时
     if len(entries) == 1:
-        return [(entries[0], _score_knowledge_base_match(question, entries[0]))]
-
-    ranked_entries = sorted(
-        ((entry, _score_knowledge_base_match(question, entry)) for entry in entries),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    top_score = ranked_entries[0][1]
-    if top_score < 3.0:
-        return ranked_entries[:max_candidates]
-
-    min_score = max(1.5, top_score * 0.55)
-    shortlisted_entries = [item for item in ranked_entries if item[1] >= min_score]
-    if not shortlisted_entries:
-        shortlisted_entries = ranked_entries[:1]
-
-    return shortlisted_entries[:max_candidates]
+        return [(entries[0], 0.0)]
+    return []
 
 
-def _select_knowledge_base_for_question(question: str) -> KnowledgeBaseCatalogEntry | None:
-    ranked_entries = _rank_knowledge_base_candidates(question, max_candidates=1)
-    if not ranked_entries:
-        return None
 
-    return ranked_entries[0][0]
 
 
 def _get_knowledge_base_entry_by_id(knowledge_base_id: str) -> KnowledgeBaseCatalogEntry:
@@ -442,7 +504,10 @@ def _score_candidate_response(
         "不清楚",
     )
     if any(marker in answer_text for marker in weak_answer_markers):
-        response_score -= 1.5
+        if "没有找到相关" in answer_text:
+            response_score -= 50.0
+        else:
+            response_score -= 1.5
 
     if query_result.entry.name and query_result.entry.name in answer_text:
         response_score += 0.5
@@ -683,6 +748,40 @@ async def _sync_knowledge_bases() -> tuple[list[KnowledgeBaseCatalogEntry], str]
         raise RuntimeError("IMA 客户端初始化或 token 刷新失败，请检查配置")
 
     entries = await ima_client.fetch_knowledge_base_catalog()
+    
+    # 获取所有条目的向量化表示并保存至目录
+    if entries:
+        logger.info(f"正在为 {len(entries)} 个知识库生成向量嵌入并存入 ChromaDB...")
+        
+        # LlamaIndex 结合 ChromaDB 以及 KeywordTableIndex
+        documents = []
+        for entry in entries:
+            target_for_emb = f"知识库名称：{entry.name}。相关描述：{entry.description or ''} {entry.introduction or ''}".strip()
+            # Node doc_id 与 entry.id 绑定，写入文档
+            doc = Document(text=target_for_emb, doc_id=entry.id, metadata={"name": entry.name, "category": entry.category, "entry_id": entry.id})
+            documents.append(doc)
+            
+        # 设置 ChromaDB 客户端和集合
+        db_path = str(Path(config_manager._workspace_root) / "chromadb")
+        os.makedirs(db_path, exist_ok=True)
+        
+        chroma_client = chromadb.PersistentClient(path=db_path)
+        chroma_collection = chroma_client.get_or_create_collection("kb_collection")
+        
+        # 生成向量索引和关键词索引
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        
+        # vector index (嵌入到 ChromaDB)
+        VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+        
+        # 关键词索引 (本地)
+        storage_context_kw = StorageContext.from_defaults()
+        SimpleKeywordTableIndex.from_documents(documents, storage_context=storage_context_kw)
+        storage_context_kw.persist(persist_dir=str(Path(db_path) / "keyword_index"))
+        
+        logger.info("ChromaDB 与关键词索引库生成完毕")
+                
     config_manager.persist_knowledge_base_catalog(entries)
     return entries, config_manager.get_catalog_file_path()
 
@@ -754,11 +853,35 @@ async def ensure_client_ready():
 
 
 @mcp.tool()
-async def ask(question: str) -> list[TextContent]:
-    """向腾讯 IMA 知识库询问任何问题
+async def list_knowledge_bases() -> list[TextContent]:
+    """获取所有可用知识库的列表，包含名称、ID和描述信息。
+    在调用 ask_with_kb 之前，建议先调用此工具以选择最匹配的知识库。
+    """
+    entries = _get_knowledge_base_entries()
+    if not entries:
+        try:
+            entries, _ = await _sync_knowledge_bases()
+        except Exception as exc:
+            return [TextContent(type="text", text=f"[ERROR] 暂无可用知识库: {exc}")]
+
+    response_lines = ["当前可用的知识库列表：\n"]
+    for entry in entries:
+        desc = entry.description or entry.introduction or "暂无描述"
+        response_lines.append(f"- 【{entry.name}】(ID: {entry.id})\n  描述: {desc}\n")
+        
+    return [TextContent(type="text", text="\n".join(response_lines).strip())]
+
+
+@mcp.tool()
+async def ask(question: str, num: int = 5) -> list[TextContent]:
+    """向腾讯 IMA 知识库询问任何问题。
+    注意：此工具在未指定知识库时会基于关键词匹配多个候选库并在后台并发请求，速度较慢。
+    优化建议：为了提高准确度并加快响应速度，建议先调用 list_knowledge_bases 获取知识库描述，
+    由主模型根据问题语义选择最相关的一个或多个知识库，然后明确调用 ask_with_kb。
 
     Args:
         question: 要询问的问题
+        num: 并行查询的最相关知识库数量，默认为 4
 
     Returns:
         IMA 知识库的回答
@@ -795,11 +918,21 @@ async def ask(question: str) -> list[TextContent]:
                 )
             ]
 
-        logger.debug("🔍 ask 工具调用", question_preview=question[:50])
+        logger.debug("🔍 ask 工具调用", question_preview=question[:50], num=num)
 
-        ranked_candidates = _rank_knowledge_base_candidates(question)
+        ranked_candidates = await _rank_knowledge_base_candidates(question, max_candidates=num)
         if not ranked_candidates:
             return [TextContent(type="text", text="[ERROR] 未找到可用知识库，请先执行 sync_knowledge_bases")]
+
+        # 相关性阈值阻断：如果最高分都低于设定阈值，直接让大模型人工确认
+        top_score = ranked_candidates[0][1]
+        threshold = 0.15  # 基于 Ollama embedding 的正常相似度基准设立的安全阈值
+        if top_score < threshold:
+            logger.warning(f"所有知识库相关性得分过低 (最高分: {top_score:.2f} < 阈值: {threshold})，中断查询。")
+            return [TextContent(
+                type="text", 
+                text="没有找到相关知识库请确认后重新手动选择数据库用ask_with_kb"
+            )]
 
         if len(ranked_candidates) == 1:
             selected_entry, _ = ranked_candidates[0]
@@ -845,7 +978,7 @@ async def ask_with_kb(question: str, knowledge_base_id: str) -> list[TextContent
 
 
 @mcp.tool()
-async def sync_knowledge_bases() -> list[TextContent]:
+async def sync_knowledge_bases(random_string: str = "") -> list[TextContent]:
     """同步 IMA 个人/共享知识库目录，并写入本地配置文件"""
     try:
         entries, catalog_file = await _sync_knowledge_bases()
@@ -865,7 +998,9 @@ async def sync_knowledge_bases() -> list[TextContent]:
     for category, category_entries in grouped_entries.items():
         response_lines.append(f"[{category}]")
         for entry in category_entries:
-            response_lines.append(f"- {entry.name} ({entry.id})")
+            desc = entry.description or entry.introduction or ""
+            desc_str = f" - 描述: {desc}" if desc else ""
+            response_lines.append(f"- {entry.name} ({entry.id}){desc_str}")
         response_lines.append("")
 
     response_lines.append("已自动写回 .env 中的 IMA_KNOWLEDGE_BASE_ID / IMA_KNOWLEDGE_BASE_IDS。")

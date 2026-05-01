@@ -49,6 +49,8 @@ class KnowledgeBaseCatalogEntry(BaseModel):
     description: Optional[str] = None
     introduction: Optional[str] = None
     permission_type: Optional[int] = None
+    # 知识库文本向量（用于相似度检索）
+    embedding: Optional[List[float]] = None
 
 
 class KnowledgeBaseCatalog(BaseModel):

@@ -1,0 +1,54 @@
+# Repository Guidelines
+
+## Project Structure & Module Organization
+
+- **Source Code**: Main implementation in `src/` (e.g., `src/ima_client.py`, `src/models.py`).
+- **Tests**: Example test in `test_sync.py` at the project root.
+- **Configuration**: Managed via environment variables and `.env` file.
+- **Logs**: Output in `logs/` (e.g., `logs/debug/`).
+- **Database/Assets**: Found in `chromadb/`, `data/`.
+
+## Build, Test, and Development Commands
+
+- **Install Dependencies**:  
+  `pip install -r requirements.txt`
+- **Run Server**:  
+  `python ima_server_simple.py`
+- **Run Tests**:  
+  `python test_sync.py`
+- **Docker**:  
+  Use `docker-compose up` to build and run with Docker.
+
+## Coding Style & Naming Conventions
+
+- **Language**: Python 3. Avoid compatibility with Python 2.
+- **Indentation**: 4 spaces, no tabs.
+- **Naming**: Use `snake_case` for variables/functions, `PascalCase` for classes.
+- **Imports**: One import per line, prefer explicit over wildcard imports.
+- **Formatting**: Use `black` and `isort` before submitting code:
+  - `black .`
+  - `isort .`
+
+## Testing Guidelines
+
+- **Frameworks**: Standard library `unittest`/`asyncio` used; adapt to `pytest` if needed.
+- **Test Files**: Place near relevant code or in root (`test_*.py` pattern).
+- **Running**:  
+  `python test_sync.py`
+- **Coverage**: Aim to cover main features and edge cases.
+
+## Commit & Pull Request Guidelines
+
+- **Commit Messages**: Use concise titles (≤ 72 chars); capitalize first word. Example:  
+  `Fix token auto-refresh in MCP handler`
+- **Pull Requests**:
+  - Describe the change and motivation.
+  - Reference any related issues (e.g., "Closes #12").
+  - Add screenshots or logs if UI or key behavior changes.
+  - Pass all tests and adhere to linting standards before requesting review.
+
+## Security & Configuration Tips
+
+- Store sensitive credentials in environment variables or `.env`.  
+- Do not commit secrets to the repository.
+

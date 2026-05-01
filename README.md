@@ -21,11 +21,14 @@
 - 🎯 **一键启动**: 简化的启动流程，自动环境检查和配置验证
 - 🐳 **Docker 支持**: 提供官方 Docker 镜像，开箱即用
 
-## 🚀 最新进展 (2025-12-21)
+## 🚀 最新进展 (2026-05)
 
 - ✅ **服务器成功运行**: 已验证基于 FastMCP 2.14.1 的 HTTP 传输模式正常工作。
-- ✅ **修复启动报错**: 解决了 `AttributeError: 'FastMCP' object has no attribute 'on_shutdown'` 问题（通过在当前版本中禁用该钩子）。
-- ✅ **全流程验证**: 验证了从 Token 刷新、会话初始化到 SSE 流式响应解析的完整链路，支持长回复（35秒+响应已验证）。
+- ✅ **Ollama 本地集成支持**: 支持通过 `OLLAMA_HOST` 连接本地 `embeddinggemma` 进行向量嵌入。
+- ✅ **ChromaDB 向量持久化**: 支持在本地挂载 `./chromadb`，以长期保留向量数据，避免重启容器后重复生成。
+- ✅ **主机网络直接通讯**: 默认提供 `network_mode: "host"`，使得 Docker 容器直接共享宿主机网络，安全且高效地访问受保护的本地大模型（如 `127.0.0.1:11434`）。
+- ✅ **按需日志输出**: 默认的 `IMA_MCP_LOG_LEVEL` 调整为 `ERROR`，减少无意义日志噪音。
+- ✅ **修复大模型客户端无参调用错误**: `sync_knowledge_bases` 工具现在能够兼容大模型传入的冗余的 `random_string` 或 `**kwargs` 参数，避免 Pydantic 校验报错。
 
 ## 快速开始
 
@@ -40,12 +43,14 @@ docker pull highkay/tencent-ima-copilot-mcp:latest
 # 运行容器（需要替换以下两个必需的环境变量）
 docker run -d \
   --name ima-copilot-mcp \
-  -p 8081:8081 \
+  --network host \
   -e IMA_X_IMA_COOKIE="your_x_ima_cookie_here" \
   -e IMA_X_IMA_BKN="your_x_ima_bkn_here" \
   -e IMA_KNOWLEDGE_BASE_CATALOG_FILE="/app/data/.ima_knowledge_bases.json" \
+  -e OLLAMA_HOST="http://127.0.0.1:11434" \
   -v $(pwd)/logs:/app/logs \
   -v $(pwd)/data:/app/data \
+  -v $(pwd)/chromadb:/app/chromadb \
   --restart unless-stopped \
   highkay/tencent-ima-copilot-mcp:latest
 
@@ -55,6 +60,8 @@ docker logs -f ima-copilot-mcp
 
 #### 2. 使用 Docker Compose（更便捷）
 
+如果使用本地 Ollama 进行向量支持，`docker-compose.yml` 已经默认开启 `network_mode: "host"` ，容器将自动连接 `http://127.0.0.1:11434`。
+
 创建 `.env` 文件（或直接在 shell 中设置环境变量）：
 
 ```bash
@@ -62,7 +69,10 @@ docker logs -f ima-copilot-mcp
 IMA_X_IMA_COOKIE="your_x_ima_cookie_here"
 IMA_X_IMA_BKN="your_x_ima_bkn_here"
 IMA_KNOWLEDGE_BASE_CATALOG_FILE="/app/data/.ima_knowledge_bases.json"
+OLLAMA_HOST="http://127.0.0.1:11434"
 ```
+
+> **注意：** 挂载的 `./chromadb`, `./logs`, `./data` 需要对 Docker 拥有写入权限。如果无法写入，可用 `sudo chown -R $USER:$USER ./chromadb ./logs ./data` 将所有权拿回本地账户。
 
 启动服务：
 
